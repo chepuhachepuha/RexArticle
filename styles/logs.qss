@@ -1,0 +1,30 @@
+/* Окно логов - тёмная тема */
+QDialog#logWindow {
+    background-color: #1E1E1E;
+}
+
+QTextEdit#logText {
+    background-color: #1E1E1E;
+    color: #D4D4D4;
+    border: none;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 12px;
+    selection-background-color: #264F78;
+}
+
+QPushButton {
+    background-color: #2D2D2D;
+    border: 1px solid #3E3E3E;
+    border-radius: 4px;
+    padding: 8px 16px;
+    font-size: 13px;
+    color: #D4D4D4;
+}
+
+QPushButton:hover {
+    background-color: #3E3E3E;
+}
+
+QPushButton:pressed {
+    background-color: #4E4E4E;
+}

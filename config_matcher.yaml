@@ -1,0 +1,13 @@
+# Сопоставление: магазин -> имя класса matcher-а (без суффикса 'Matcher')
+matcher_map:
+  "Розенберг_WB": "Rozenberg"
+  "Алексеев_WB": "Alekseev"
+  "Zino_WB": "PdfOnly"
+  "Вильдан_WB": "PdfOnly"
+  "ИП Ященко_WB": "PdfOnly"
+  "ИП Бузунова_WB": "PdfOnly"
+  "ИП Коновалов_WB": "PdfOnly"
+  "ИП Немцова_WB": "PdfOnly"
+  "KRISTABELL_WB": "Kristabell"
+
+default_matcher: "Simple"

@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Secrets and local environment
+.env
+.env.*
+*.pem
+*.key
+
+# User-specific application data
+config.json
+stores.json
+manual_overrides.json
+index/
+.index_state/
+logs/
+
+# Build and release artifacts
+build/
+dist/
+release/
+*.rar
+*.zip
+*.exe
+
+# OS and IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp

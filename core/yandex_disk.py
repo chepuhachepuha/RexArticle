@@ -13,7 +13,7 @@ from typing import Callable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-from core.paths import resource_path
+from core.paths import get_data_path, resource_path
 
 
 API_BASE_URL = "https://cloud-api.yandex.net/v1/disk"
@@ -21,7 +21,12 @@ OAUTH_AUTHORIZE_URL = "https://oauth.yandex.ru/authorize"
 DEFAULT_CLIENT_ID = "77312c3ec72a418ebb59fd460c6940f9"
 DEFAULT_REDIRECT_URI = "https://oauth.yandex.ru/verification_code"
 TOKEN_ENVIRONMENT_VARIABLE = "REXARTICLES_YANDEX_TOKEN"
+TOKEN_CONFIG_KEY = "yandex_oauth_token"
+CONFIG_FILE = get_data_path("config.json")
 _session_token = None
+_saved_token_checked = False
+_saved_token_cache = None
+_CONFIG_LOCK = threading.RLock()
 
 
 class YandexDiskError(RuntimeError):
@@ -131,18 +136,88 @@ class YandexDiskFile:
         return to_yandex_uri(self.path)
 
 
-def configure_yandex_token(token: str | None) -> None:
-    """Задаёт токен только в памяти процесса; на диск и в логи он не попадает."""
+def _read_app_config() -> dict:
+    with _CONFIG_LOCK:
+        if not os.path.exists(CONFIG_FILE):
+            return {}
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as file:
+                value = json.load(file)
+            return value if isinstance(value, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+
+def _write_app_config(config: dict) -> None:
+    with _CONFIG_LOCK:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        temporary = CONFIG_FILE + ".tmp"
+        try:
+            with open(temporary, "w", encoding="utf-8") as file:
+                json.dump(config, file, ensure_ascii=False, indent=2)
+            os.replace(temporary, CONFIG_FILE)
+        except OSError as error:
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+            raise YandexDiskError(f"Не удалось сохранить config.json: {error}") from error
+
+
+def load_saved_yandex_token() -> str:
+    """Загружает токен из config.json."""
+    global _session_token, _saved_token_checked, _saved_token_cache
+    if _saved_token_checked:
+        return _saved_token_cache or ""
+    _saved_token_checked = True
+    _saved_token_cache = str(
+        _read_app_config().get(TOKEN_CONFIG_KEY, "") or ""
+    ).strip() or None
+    if not _session_token:
+        _session_token = _saved_token_cache
+    return _saved_token_cache or ""
+
+
+def save_yandex_token(token: str) -> None:
+    """Сохраняет токен в config.json."""
+    global _saved_token_checked, _saved_token_cache
+    value = token.strip()
+    if not value:
+        raise YandexDiskError("OAuth-токен пуст")
+    config = _read_app_config()
+    config[TOKEN_CONFIG_KEY] = value
+    _write_app_config(config)
+    _saved_token_checked = True
+    _saved_token_cache = value
+
+
+def delete_saved_yandex_token() -> None:
+    """Удаляет сохранённый токен и очищает токен текущего процесса."""
+    global _session_token, _saved_token_checked, _saved_token_cache
+    config = _read_app_config()
+    if TOKEN_CONFIG_KEY in config:
+        del config[TOKEN_CONFIG_KEY]
+        _write_app_config(config)
+    _session_token = None
+    _saved_token_checked = True
+    _saved_token_cache = None
+
+
+def configure_yandex_token(token: str | None, *, persist: bool = False) -> None:
+    """Задаёт токен процессу и при необходимости сохраняет его в config.json."""
     global _session_token
     _session_token = token.strip() if token else None
+    if persist and _session_token:
+        save_yandex_token(_session_token)
 
 
 def get_yandex_token(token: str | None = None) -> str:
-    """Берёт токен из аргумента, памяти или окружения, не сохраняя его на диск."""
+    """Берёт токен из аргумента, памяти, окружения или config.json."""
     value = (
         token
         or _session_token
         or os.environ.get(TOKEN_ENVIRONMENT_VARIABLE, "")
+        or load_saved_yandex_token()
     ).strip()
     if not value:
         raise YandexDiskError(

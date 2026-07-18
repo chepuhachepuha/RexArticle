@@ -7,9 +7,10 @@ from PySide6.QtWidgets import (
     QDialog,
 )
 from PySide6.QtCore import (
-    Qt, QDateTime, QTime, QRunnable, QThreadPool, Signal, QObject, Slot, QTimer,
+    Qt, QDateTime, QTime, QUrl, QRunnable, QThreadPool, Signal, QObject, Slot,
+    QTimer,
 )
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QDesktopServices
 from core.paths import get_data_path
 from gui.widgets.supply_tree import SupplyTreeView, SupplyTreeModel, SupplyDeliveryItem
 from gui.widgets.override_delegate import OverrideButtonDelegate
@@ -26,12 +27,32 @@ from indexer import (
     update_yandex_indexes,
 )
 from matcher import get_matcher_for_store
-from manual_overrides import set_override
+from manual_overrides import get_override, set_override
 
 
 # ============================================
 # Флаг отмены (разделяется между main thread и workers)
 # ============================================
+
+
+def _delivery_output_folder_name(pdf_path, store_name, append_store_name):
+    folder_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    if append_store_name and store_name:
+        safe_store_name = "".join(
+            "_" if character in "/\\:" else character
+            for character in str(store_name)
+        ).strip()
+        if safe_store_name:
+            folder_name += f" [{safe_store_name}]"
+    return folder_name
+
+
+def _result_file_base_name(file_path, article, manual_override_path):
+    """Для ручного override называет итоговую копию артикулом поставки."""
+    original_name = os.path.splitext(os.path.basename(file_path))[0]
+    if manual_override_path and file_path == manual_override_path:
+        return article
+    return original_name
 
 class CancellationFlag:
     """Общий флаг отмены для worker'ов."""
@@ -152,6 +173,7 @@ class CloudAutoIndexWorker(QRunnable):
         stores = load_stores()
         print("[INDEX AUTO] Запущено фоновое append-only обновление облака")
         tasks = []
+        total_cloud_indexes = 0
         for store_name, store_data in stores.items():
             for supply_type, type_data in store_data.items():
                 if type_data.get("source", "local") != "yandex":
@@ -159,6 +181,7 @@ class CloudAutoIndexWorker(QRunnable):
                 cloud_path = type_data.get("path", "").strip()
                 if not cloud_path:
                     continue
+                total_cloud_indexes += 1
                 key = f"{store_name}_{supply_type}"
                 if not has_yandex_index_for_store(key, cloud_path):
                     print(
@@ -168,11 +191,23 @@ class CloudAutoIndexWorker(QRunnable):
                     continue
                 tasks.append({"key": key, "folder": cloud_path})
         try:
-            update_yandex_indexes(tasks)
+            results = update_yandex_indexes(tasks)
+            changed_count = sum(bool(changed) for changed in results.values())
+            skipped_count = total_cloud_indexes - len(results)
+            print(
+                f"[INDEX AUTO] Обработано {len(results)} из "
+                f"{total_cloud_indexes} облачных индексов; "
+                f"новые файлы добавлены в {changed_count}; "
+                f"пропущено {skipped_count}"
+            )
         except Exception as error:
             # Фоновая ошибка не должна останавливать поиск или показывать
             # навязчивое модальное окно пользователю.
             print(f"[INDEX AUTO] Ошибка пакетного обновления: {error}")
+            print(
+                f"[INDEX AUTO] Обновление выполнено не полностью; "
+                f"запланировано индексов: {total_cloud_indexes}"
+            )
         print("[INDEX AUTO] Фоновое обновление завершено")
         self.signals.finished.emit()
 
@@ -186,12 +221,19 @@ class SearchSignals(QObject):
 
 
 class SearchWorker(QRunnable):
-    def __init__(self, delivery_items, output_folder, matcher_cache):
+    def __init__(
+        self,
+        delivery_items,
+        output_folder,
+        matcher_cache,
+        append_store_name=False,
+    ):
         super().__init__()
         self.setAutoDelete(True)
         self.delivery_items = delivery_items
         self.output_folder = output_folder
         self.matcher_cache = matcher_cache
+        self.append_store_name = append_store_name
         self.signals = SearchSignals()
     
     @Slot()
@@ -215,8 +257,11 @@ class SearchWorker(QRunnable):
         base_output_folder = os.path.join(self.output_folder, "Найденные_принты_все")
         os.makedirs(base_output_folder, exist_ok=True)
         
-        pdf_name = os.path.basename(delivery_item.pdf_path)
-        folder_name = os.path.splitext(pdf_name)[0]
+        folder_name = _delivery_output_folder_name(
+            delivery_item.pdf_path,
+            getattr(delivery_item, "display_store_name", store_name),
+            self.append_store_name,
+        )
         output_folder = os.path.join(base_output_folder, folder_name)
         os.makedirs(output_folder, exist_ok=True)
         
@@ -233,9 +278,15 @@ class SearchWorker(QRunnable):
             if matches:
                 file = matches[0]
                 self.signals.article_status.emit(delivery_item, i, "Найден")
-                
+
                 try:
-                    base_name, ext = os.path.splitext(os.path.basename(file))
+                    _, ext = os.path.splitext(os.path.basename(file))
+                    manual_override_path = get_override(
+                        store_name, supply_type, article, size
+                    )
+                    base_name = _result_file_base_name(
+                        file, article, manual_override_path
+                    )
                     if location == "СПИНА":
                         suffix = f"[{size} СПИНА]" if size else "[СПИНА]"
                     else:
@@ -375,6 +426,18 @@ class MainWindow(QMainWindow):
         self.cloud_background_index_time = str(
             config.get("cloud_background_index_time", "03:00")
         )
+        self.auto_expand_delivery = bool(
+            config.get("personalization_auto_expand_delivery", True)
+        )
+        self.open_results_folder = bool(
+            config.get("personalization_open_results_folder", False)
+        )
+        self.append_store_to_delivery_folder = bool(config.get(
+            "personalization_append_store_to_delivery_folder", False
+        ))
+        self.store_display_names = dict(
+            config.get("store_display_names", {}) or {}
+        )
         if not os.path.exists(self.config_file):
             self.save_config()
     
@@ -391,6 +454,12 @@ class MainWindow(QMainWindow):
             "output_folder": self.output_folder,
             "cloud_background_index_enabled": self.cloud_background_index_enabled,
             "cloud_background_index_time": self.cloud_background_index_time,
+            "personalization_auto_expand_delivery": self.auto_expand_delivery,
+            "personalization_open_results_folder": self.open_results_folder,
+            "personalization_append_store_to_delivery_folder": (
+                self.append_store_to_delivery_folder
+            ),
+            "store_display_names": self.store_display_names,
         })
         with open(self.config_file, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
@@ -485,10 +554,6 @@ class MainWindow(QMainWindow):
         self.settings_action = QAction("⚙️ Настройки", self)
         self.settings_action.triggered.connect(self.open_settings)
         add_action_button(self.settings_action)
-        
-        self.logs_action = QAction("📋 Логи", self)
-        self.logs_action.triggered.connect(self.open_logs)
-        add_action_button(self.logs_action)
         
         toolbar_layout.addStretch()
         
@@ -598,7 +663,11 @@ class MainWindow(QMainWindow):
             self.pdf_files.append(pdf_path)
             
             delivery_item = self.tree_model.add_delivery(
-                pdf_path, store_name, supply_type, folder
+                pdf_path,
+                store_name,
+                supply_type,
+                folder,
+                self._display_store_name(store_name),
             )
             self.tree_model.update_delivery_status(delivery_item, "Парсинг...")
             self.delivery_items.append(delivery_item)
@@ -639,13 +708,21 @@ class MainWindow(QMainWindow):
             return
         
         if store_name and store_name != "UNKNOWN" and store_name != delivery_item.store_name:
-            self.tree_model.update_store_name(delivery_item, store_name)
+            self.tree_model.update_store_name(
+                delivery_item,
+                store_name,
+                self._display_store_name(store_name),
+            )
         
         if not articles:
             self.tree_model.update_delivery_status(delivery_item, "Пусто")
         else:
             self.tree_model.add_articles(delivery_item, articles, sizes, locations)
             self.tree_model.update_delivery_status(delivery_item, "Ожидание")
+            delivery_index = self.tree_model.index(delivery_item.row(), 0)
+            self.tree_view.setExpanded(
+                delivery_index, self.auto_expand_delivery
+            )
         
         # Обновляем диалог прогресса
         if self.parse_dialog:
@@ -972,7 +1049,12 @@ class MainWindow(QMainWindow):
         
         self.tree_model.update_delivery_status(delivery_item, "Поиск...")
         
-        worker = SearchWorker([delivery_item], self.output_folder, self.matcher_cache)
+        worker = SearchWorker(
+            [delivery_item],
+            self.output_folder,
+            self.matcher_cache,
+            self.append_store_to_delivery_folder,
+        )
         worker.signals.article_status.connect(self._on_article_status)
         worker.signals.article_copied.connect(self._on_article_copied)
         worker.signals.delivery_finished.connect(self._on_delivery_finished)
@@ -1067,7 +1149,12 @@ class MainWindow(QMainWindow):
                 delivery_item.child(i).copied_file = None
             self.tree_model.update_delivery_status(delivery_item, "Поиск...")
         
-        worker = SearchWorker(self.delivery_items, self.output_folder, self.matcher_cache)
+        worker = SearchWorker(
+            self.delivery_items,
+            self.output_folder,
+            self.matcher_cache,
+            self.append_store_to_delivery_folder,
+        )
         worker.signals.article_status.connect(self._on_article_status)
         worker.signals.article_copied.connect(self._on_article_copied)
         worker.signals.delivery_finished.connect(self._on_delivery_finished)
@@ -1083,8 +1170,15 @@ class MainWindow(QMainWindow):
     
     def _on_delivery_finished(self, delivery_item):
         base_output_folder = os.path.join(self.output_folder, "Найденные_принты_все")
-        pdf_name = os.path.basename(delivery_item.pdf_path)
-        folder_name = os.path.splitext(pdf_name)[0]
+        folder_name = _delivery_output_folder_name(
+            delivery_item.pdf_path,
+            getattr(
+                delivery_item,
+                "display_store_name",
+                delivery_item.store_name,
+            ),
+            self.append_store_to_delivery_folder,
+        )
         output_folder = os.path.join(base_output_folder, folder_name)
         
         delivery_item.output_folder = output_folder
@@ -1093,6 +1187,11 @@ class MainWindow(QMainWindow):
     def _on_search_finished(self):
         self.is_searching = False
         self._set_actions_enabled(True)
+        results_folder = os.path.join(
+            self.output_folder, "Найденные_принты_все"
+        )
+        if self.open_results_folder and os.path.isdir(results_folder):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(results_folder))
         QMessageBox.information(self, "Готово", "Обработка всех поставок завершена")
     
     def _on_search_error(self, error_message):
@@ -1103,6 +1202,10 @@ class MainWindow(QMainWindow):
     # ============================================
     # Диалоги
     # ============================================
+
+    def _display_store_name(self, store_name):
+        display_name = str(self.store_display_names.get(store_name, "")).strip()
+        return display_name or store_name
     
     def open_settings(self):
         from gui.settings_window import SettingsWindow
@@ -1111,7 +1214,16 @@ class MainWindow(QMainWindow):
         if getattr(dialog, 'needs_reset_cache', False):
             self.matcher_cache.clear()
         self.load_config()
+        self.tree_model.refresh_store_display_names(self.store_display_names)
         self._schedule_next_cloud_auto_index()
+
+    def closeEvent(self, event):
+        """Красная кнопка скрывает окно, не останавливая фоновые задачи."""
+        if getattr(self, "allow_quit", False) or not event.spontaneous():
+            event.accept()
+            return
+        event.ignore()
+        self.hide()
     
     def open_logs(self):
         from gui.dialogs.log_window import LogWindow

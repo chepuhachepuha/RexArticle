@@ -1,10 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
 import ssl
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
-pyside6_datas = collect_data_files('PySide6')
 certificate_datas = []
 certificate_candidates = [
     ssl.get_default_verify_paths().cafile,
@@ -27,14 +25,14 @@ our_datas = [
     ('config.json', '.'),
     ('stores.json', '.'),
     ('manual_overrides.json', '.'),
-    ('icon.ico', '.'),
+    ('icon.icns', '.'),
 ]
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=pyside6_datas + certificate_datas + our_datas,
+    datas=certificate_datas + our_datas,
     hiddenimports=[
         'PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets',
         'parser', 'ozon_parser', 'ozon_marker', 'supply_detector',
@@ -46,7 +44,7 @@ a = Analysis(
         'gui.dialogs.parse_progress_dialog',
         'gui.widgets.supply_tree', 'gui.widgets.override_delegate',
         'pdfplumber', 'fitz', 'pymupdf', 'yaml', 'ssl',
-    ] + collect_submodules('PySide6'),
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -78,7 +76,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='icon.ico',
+    icon='icon.icns',
 )
 
 coll = COLLECT(
@@ -90,4 +88,15 @@ coll = COLLECT(
     upx=True,
     upx_exclude=[],
     name='RexArticles',
+)
+
+app = BUNDLE(
+    coll,
+    name='RexArticles.app',
+    icon='icon.icns',
+    bundle_identifier='ru.rexarticles.app',
+    info_plist={
+        'CFBundleDisplayName': 'RexArticles',
+        'NSHighResolutionCapable': True,
+    },
 )

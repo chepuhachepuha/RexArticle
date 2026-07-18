@@ -40,10 +40,14 @@ class SupplyRootItem(SupplyItem):
 class SupplyDeliveryItem(SupplyItem):
     """Элемент поставки (parent-строка)."""
 
-    def __init__(self, pdf_path, store_name, supply_type, folder, parent):
+    def __init__(
+        self, pdf_path, store_name, supply_type, folder, parent,
+        display_store_name=None,
+    ):
         super().__init__(parent)
         self.pdf_path = pdf_path
         self.store_name = store_name
+        self.display_store_name = display_store_name or store_name
         self.supply_type = supply_type
         self.folder = folder
         self.article_count = 0
@@ -63,7 +67,7 @@ class SupplyDeliveryItem(SupplyItem):
     def get_display_data(self):
         import os
         pdf_name = os.path.basename(self.pdf_path)
-        store_info = f"{self.store_name} ({self.supply_type})"
+        store_info = f"{self.display_store_name} ({self.supply_type})"
         progress = f"{self.found_count}/{self.article_count}" if self.article_count > 0 else "0/0"
 
         return [
@@ -204,10 +208,14 @@ class SupplyTreeModel(QAbstractItemModel):
             return Qt.ItemFlag.NoItemFlags
         return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
 
-    def add_delivery(self, pdf_path, store_name, supply_type, folder):
+    def add_delivery(
+        self, pdf_path, store_name, supply_type, folder,
+        display_store_name=None,
+    ):
         """Добавляет новую поставку в дерево."""
         delivery_item = SupplyDeliveryItem(
-            pdf_path, store_name, supply_type, folder, self.root_item
+            pdf_path, store_name, supply_type, folder, self.root_item,
+            display_store_name,
         )
         self.beginInsertRows(
             QModelIndex(),
@@ -279,12 +287,30 @@ class SupplyTreeModel(QAbstractItemModel):
         if article_index < delivery_item.child_count():
             delivery_item.child(article_index).copied_file = file_path
 
-    def update_store_name(self, delivery_item, new_store_name):
+    def update_store_name(
+        self, delivery_item, new_store_name, display_store_name=None
+    ):
         """Обновляет имя магазина поставки."""
         if (delivery_item.store_name != new_store_name
                 and new_store_name and new_store_name != "UNKNOWN"):
             delivery_item.store_name = new_store_name
+            delivery_item.display_store_name = display_store_name or new_store_name
             delivery_index = self.createIndex(delivery_item.row(), 0, delivery_item)
+            last_col_index = self.createIndex(
+                delivery_item.row(), self.columnCount() - 1, delivery_item
+            )
+            self.dataChanged.emit(delivery_index, last_col_index)
+
+    def refresh_store_display_names(self, display_names):
+        """Обновляет видимые названия, не меняя внутренние ключи."""
+        for delivery_item in self.root_item.child_items:
+            delivery_item.display_store_name = (
+                str(display_names.get(delivery_item.store_name, "")).strip()
+                or delivery_item.store_name
+            )
+            delivery_index = self.createIndex(
+                delivery_item.row(), 0, delivery_item
+            )
             last_col_index = self.createIndex(
                 delivery_item.row(), self.columnCount() - 1, delivery_item
             )
@@ -311,9 +337,11 @@ class SupplyTreeView(QTreeView):
         self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setRootIsDecorated(True)
+        # Единая геометрия строк не даёт индикаторам раскрытия «прыгать» во
+        # время анимации на длинном списке поставок. Саму анимацию сохраняем.
         self.setAnimated(True)
         self.setExpandsOnDoubleClick(False)
-        self.setUniformRowHeights(False)
+        self.setUniformRowHeights(True)
         self.setIndentation(20)
 
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)

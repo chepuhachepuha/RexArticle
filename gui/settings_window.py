@@ -6,7 +6,8 @@ from PySide6.QtWidgets import (
     QScrollArea, QWidget, QFrame, QLineEdit,
     QCheckBox, QFileDialog, QMessageBox, QGroupBox,
     QInputDialog, QSplitter, QTextEdit, QApplication, QProgressBar, QComboBox,
-    QTabWidget, QTimeEdit
+    QTabWidget, QTimeEdit, QTableWidget, QTableWidgetItem, QDialogButtonBox,
+    QHeaderView
 )
 from PySide6.QtCore import (
     Qt, QTime, QTimer, QObject, QRunnable, QThreadPool, Signal, Slot, QUrl,
@@ -22,7 +23,8 @@ from indexer import (
 )
 from core.yandex_disk import (
     YandexDiskClient, YandexDiskError, build_authorization_url,
-    configure_yandex_token,
+    configure_yandex_token, delete_saved_yandex_token,
+    load_saved_yandex_token,
 )
 from gui.dialogs.yandex_disk_picker import YandexDiskPickerDialog
 
@@ -193,6 +195,9 @@ class SettingsWindow(QDialog):
         self.stores = load_stores()
         self.config_file = get_data_path("config.json")
         self.app_config = self._load_app_config()
+        self.store_display_names = dict(
+            self.app_config.get("store_display_names", {}) or {}
+        )
         self.selected_store = None
         self.needs_reset_cache = False
         self.type_vars = {}
@@ -412,13 +417,179 @@ class SettingsWindow(QDialog):
         
         stores_layout.addWidget(splitter)
         self.tabs.addTab(stores_tab, "Магазины")
+        self.tabs.addTab(self._create_personalization_tab(), "Персонализация")
         self.tabs.addTab(self._create_yandex_tab(), "Яндекс Диск")
         
         self.refresh_store_buttons()
         self._clear_inline_styles()
 
+    def _create_personalization_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(12)
+
+        title = QLabel("Персонализация")
+        title.setObjectName("settingsTitle")
+        layout.addWidget(title)
+
+        hint = QLabel("Общее поведение программы для повседневной работы")
+        hint.setObjectName("settingsSubtitle")
+        layout.addWidget(hint)
+
+        behavior_group = QGroupBox("Поведение поставок")
+        behavior_group.setProperty("settingsCard", True)
+        behavior_layout = QVBoxLayout(behavior_group)
+        behavior_layout.setSpacing(12)
+
+        self.auto_expand_delivery_checkbox = QCheckBox(
+            "Автоматически раскрывать поставку после загрузки"
+        )
+        self.auto_expand_delivery_checkbox.setChecked(bool(
+            self.app_config.get("personalization_auto_expand_delivery", True)
+        ))
+        behavior_layout.addWidget(self.auto_expand_delivery_checkbox)
+
+        self.open_results_folder_checkbox = QCheckBox(
+            "Автоматически открывать папку результатов после завершения"
+        )
+        self.open_results_folder_checkbox.setChecked(bool(
+            self.app_config.get("personalization_open_results_folder", False)
+        ))
+        behavior_layout.addWidget(self.open_results_folder_checkbox)
+
+        self.append_store_name_checkbox = QCheckBox(
+            "Подписывать название магазина в [] в конце названия папки поставки"
+        )
+        self.append_store_name_checkbox.setChecked(bool(
+            self.app_config.get(
+                "personalization_append_store_to_delivery_folder", False
+            )
+        ))
+        behavior_layout.addWidget(self.append_store_name_checkbox)
+
+        self.store_names_button = QPushButton("Названия магазинов")
+        self.store_names_button.clicked.connect(self._edit_store_display_names)
+        behavior_layout.addWidget(self.store_names_button)
+
+        self.logs_button = QPushButton("Логи")
+        self.logs_button.clicked.connect(self._open_logs)
+        behavior_layout.addWidget(self.logs_button)
+
+        layout.addWidget(behavior_group)
+        layout.addStretch()
+
+        for checkbox in (
+            self.auto_expand_delivery_checkbox,
+            self.open_results_folder_checkbox,
+            self.append_store_name_checkbox,
+        ):
+            checkbox.toggled.connect(self._save_personalization_settings)
+        return tab
+
+    def _display_store_name(self, store_name):
+        display_name = str(self.store_display_names.get(store_name, "")).strip()
+        return display_name or store_name
+
+    def _open_logs(self):
+        from gui.dialogs.log_window import LogWindow
+
+        LogWindow(self).exec()
+
+    def _edit_store_display_names(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Названия магазинов")
+        dialog.resize(620, 440)
+        layout = QVBoxLayout(dialog)
+
+        hint = QLabel(
+            "Оригинальные названия используются внутренними алгоритмами. "
+            "Изменяется только отображение в интерфейсе и в суффиксе папки."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        table = QTableWidget(len(self.stores), 2, dialog)
+        table.setHorizontalHeaderLabels([
+            "Оригинальное название", "Отображаемое название"
+        ])
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+
+        for row, store_name in enumerate(self.stores):
+            original_item = QTableWidgetItem(store_name)
+            original_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            )
+            table.setItem(row, 0, original_item)
+            table.setItem(
+                row, 1,
+                QTableWidgetItem(self._display_store_name(store_name))
+            )
+        layout.addWidget(table)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        aliases = {}
+        for row in range(table.rowCount()):
+            original = table.item(row, 0).text().strip()
+            display_item = table.item(row, 1)
+            display = display_item.text().strip() if display_item else ""
+            if display and display != original:
+                aliases[original] = display
+
+        self.app_config = self._load_app_config()
+        self.app_config["store_display_names"] = aliases
+        try:
+            with open(self.config_file, "w", encoding="utf-8") as file:
+                json.dump(self.app_config, file, ensure_ascii=False, indent=2)
+        except OSError as error:
+            QMessageBox.critical(
+                self, "Ошибка", f"Не удалось сохранить названия: {error}"
+            )
+            return
+        self.store_display_names = aliases
+        self.refresh_store_buttons()
+        if self.selected_store:
+            self.store_title.setText(
+                f"Настройки: {self._display_store_name(self.selected_store)}"
+            )
+
+    def _save_personalization_settings(self, *_):
+        self.app_config = self._load_app_config()
+        self.app_config.update({
+            "personalization_auto_expand_delivery": (
+                self.auto_expand_delivery_checkbox.isChecked()
+            ),
+            "personalization_open_results_folder": (
+                self.open_results_folder_checkbox.isChecked()
+            ),
+            "personalization_append_store_to_delivery_folder": (
+                self.append_store_name_checkbox.isChecked()
+            ),
+        })
+        try:
+            with open(self.config_file, "w", encoding="utf-8") as file:
+                json.dump(self.app_config, file, ensure_ascii=False, indent=2)
+        except OSError as error:
+            print(f"[SETTINGS] Не удалось сохранить персонализацию: {error}")
+
     def _create_yandex_tab(self):
-        """Настройка временного OAuth-токена и проверка подключения."""
+        """Настройка OAuth-токена и проверка подключения."""
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(28, 24, 28, 24)
@@ -428,7 +599,7 @@ class SettingsWindow(QDialog):
         layout.addWidget(title)
         hint = QLabel(
             "Подключите Яндекс Диск, чтобы выбирать облачные папки и искать "
-            "принты без Finder. Токен хранится только до закрытия программы."
+            "принты без Finder. Токен сохраняется в config.json."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -449,9 +620,20 @@ class SettingsWindow(QDialog):
         check_connection = QPushButton("Проверить подключение")
         check_connection.clicked.connect(self._check_yandex_connection)
         buttons.addWidget(check_connection)
+        delete_token = QPushButton("Удалить токен")
+        delete_token.setProperty("destructive", True)
+        delete_token.clicked.connect(self._delete_yandex_token)
+        buttons.addWidget(delete_token)
         buttons.addStretch()
         layout.addLayout(buttons)
-        self.yandex_status = QLabel("Не подключено")
+        if load_saved_yandex_token():
+            self.yandex_token_input.setPlaceholderText(
+                "Токен сохранён в config.json"
+            )
+            status_text = "Сохранённый токен будет использован автоматически"
+        else:
+            status_text = "Не подключено"
+        self.yandex_status = QLabel(status_text)
         layout.addWidget(self.yandex_status)
 
         schedule_group = QGroupBox("Фоновое обновление индексов")
@@ -514,6 +696,8 @@ class SettingsWindow(QDialog):
             return {}
 
     def _save_background_settings(self, *_):
+        # Перечитываем файл, чтобы не затереть сохранённый OAuth-токен.
+        self.app_config = self._load_app_config()
         self.app_config.update({
             "cloud_background_index_enabled": (
                 self.cloud_background_enabled.isChecked()
@@ -529,17 +713,40 @@ class SettingsWindow(QDialog):
             print(f"[INDEX AUTO] Не удалось сохранить расписание: {error}")
 
     def _apply_yandex_token(self):
-        configure_yandex_token(self.yandex_token_input.text())
-        self.yandex_status.setText("Токен применён для текущего запуска")
+        token = self.yandex_token_input.text().strip()
+        if not token:
+            if load_saved_yandex_token():
+                self.yandex_status.setText("Используется сохранённый токен")
+                return True
+            self.yandex_status.setText("Введите OAuth-токен")
+            return False
+        try:
+            configure_yandex_token(token, persist=True)
+        except YandexDiskError as error:
+            self.yandex_status.setText(f"Токен применён, но не сохранён: {error}")
+            return False
+        self.yandex_token_input.clear()
+        self.yandex_token_input.setPlaceholderText(
+            "Токен сохранён в config.json"
+        )
+        self.yandex_status.setText("Токен сохранён и применён")
+        return True
 
     def _check_yandex_connection(self):
-        self._apply_yandex_token()
+        if not self._apply_yandex_token():
+            return
         try:
             YandexDiskClient().list_directory("disk:/")
         except YandexDiskError as error:
             self.yandex_status.setText(f"Ошибка подключения: {error}")
         else:
             self.yandex_status.setText("Подключение к Яндекс Диску установлено")
+
+    def _delete_yandex_token(self):
+        delete_saved_yandex_token()
+        self.yandex_token_input.clear()
+        self.yandex_token_input.setPlaceholderText("OAuth-токен Яндекс Диска")
+        self.yandex_status.setText("Сохранённый токен удалён")
 
     def _clear_inline_styles(self):
         """Оставляет оформление глобальной системной теме, а не жёстким цветам."""
@@ -592,7 +799,7 @@ class SettingsWindow(QDialog):
         """
         
         for store_name in self.stores.keys():
-            button = QPushButton(store_name)
+            button = QPushButton(self._display_store_name(store_name))
             button.setFixedHeight(30)
             
             button.setProperty("sidebarItem", True)
@@ -605,7 +812,9 @@ class SettingsWindow(QDialog):
     
     def select_store(self, store_name):
         self.selected_store = store_name
-        self.store_title.setText(f"Настройки: {store_name}")
+        self.store_title.setText(
+            f"Настройки: {self._display_store_name(store_name)}"
+        )
         self.update_store_index_button.setEnabled(True)
         
         self.refresh_types_for_store(store_name)
@@ -1152,7 +1361,10 @@ class SettingsWindow(QDialog):
                     override_path = type_data.get("override_path", "").strip() or None
                 tasks.append({
                     "key": f"{store_name}_{supply_type}",
-                    "label": f"{store_name} ({supply_type})",
+                    "label": (
+                        f"{self._display_store_name(store_name)} "
+                        f"({supply_type})"
+                    ),
                     "folder": folder,
                     "override_path": override_path,
                     "source": type_data.get("source", "local"),

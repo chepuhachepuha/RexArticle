@@ -3,11 +3,14 @@ import yaml
 import re
 from manual_overrides import get_override
 from indexer import get_index_for_store
-from core.paths import resource_path
+from core.paths import resource_path, get_data_path
+from core.store_manager import load_stores, save_stores, get_type_data
+from core.json_storage import atomic_write_json
 from core.yandex_disk import is_yandex_uri
 
 CONFIG_PATH = resource_path("config_matcher.yaml")
 _config_cache = None
+_legacy_migration_checked = False
 
 
 def load_matcher_config():
@@ -32,10 +35,10 @@ def load_matcher_config():
 
 class BaseMatcher:
     """Базовый класс для всех matcher'ов."""
-    
-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name):
+
+    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None):
         raise NotImplementedError("Subclasses must implement find_file_by_article_and_size")
-    
+
     def find_file_by_article(self, article, store_name):
         index = get_index_for_store(store_name)
         if article in index:
@@ -53,12 +56,24 @@ class BaseMatcher:
                 ):
                     return override_path
         return None
-    
-    def find_with_override(self, article, size_from_pdf, store_name, search_func):
+
+    def find_with_override(
+        self, article, size_from_pdf, store_name, search_func,
+        allowed_extensions=None,
+    ):
         matches = search_func(article, size_from_pdf, store_name)
+        if allowed_extensions is not None:
+            normalised_extensions = {
+                extension.lower() if extension.startswith(".") else f".{extension.lower()}"
+                for extension in allowed_extensions
+            }
+            matches = [
+                path for path in matches
+                if os.path.splitext(path)[1].lower() in normalised_extensions
+            ]
         if matches:
             return matches
-        
+
         override_path = self._check_manual_override(article, size_from_pdf, store_name)
         if override_path:
             return [override_path]
@@ -73,8 +88,8 @@ class SimpleMatcher(BaseMatcher):
     
     # Расширения, которые исключаем из поиска
     EXCLUDED_EXTENSIONS = {'.jpg'}
-    
-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name):
+
+    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None):
         def search_func(art, size, store):
             index = get_index_for_store(store)
             if art in index:
@@ -85,24 +100,30 @@ class SimpleMatcher(BaseMatcher):
                 ]
                 return filtered_files
             return []
-        
-        return self.find_with_override(article, size_from_pdf, store_name, search_func)
+
+        return self.find_with_override(
+            article, size_from_pdf, store_name, search_func,
+            allowed_extensions=allowed_extensions,
+        )
 
 
 class RozenbergMatcher(BaseMatcher):
-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name):
+    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None):
         def search_func(art, size, store):
             index = get_index_for_store(store)
             clean_article = art.split('-', 1)[0]
             if clean_article in index:
                 return index[clean_article]
             return []
-        
-        return self.find_with_override(article, size_from_pdf, store_name, search_func)
+
+        return self.find_with_override(
+            article, size_from_pdf, store_name, search_func,
+            allowed_extensions=allowed_extensions,
+        )
 
 
 class AlekseevMatcher(BaseMatcher):
-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name):
+    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None):
         def search_func(art, size, store):
             index = get_index_for_store(store)
             if art in index:
@@ -112,12 +133,15 @@ class AlekseevMatcher(BaseMatcher):
             if clean_article in index:
                 return index[clean_article]
             return []
-        
-        return self.find_with_override(article, size_from_pdf, store_name, search_func)
+
+        return self.find_with_override(
+            article, size_from_pdf, store_name, search_func,
+            allowed_extensions=allowed_extensions,
+        )
 
 
 class PdfOnlyMatcher(BaseMatcher):
-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name):
+    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None):
         def search_func(art, size, store):
             index = get_index_for_store(store)
             if art in index:
@@ -127,15 +151,18 @@ class PdfOnlyMatcher(BaseMatcher):
                 ]
                 return pdf_files
             return []
-        
-        return self.find_with_override(article, size_from_pdf, store_name, search_func)
+
+        return self.find_with_override(
+            article, size_from_pdf, store_name, search_func,
+            allowed_extensions=allowed_extensions,
+        )
 
 
 class KristabellMatcher(BaseMatcher):
-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name):
+    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None):
         def search_func(art, size, store):
             index = get_index_for_store(store)
-            
+
             clean_article = art.replace("/", " ")
             
             size_upper = size.upper().strip() if size else ""
@@ -153,8 +180,11 @@ class KristabellMatcher(BaseMatcher):
             if search_key in index:
                 return index[search_key]
             return []
-        
-        return self.find_with_override(article, size_from_pdf, store_name, search_func)
+
+        return self.find_with_override(
+            article, size_from_pdf, store_name, search_func,
+            allowed_extensions=allowed_extensions,
+        )
 
 
 MATCHER_CLASSES = {
@@ -166,9 +196,43 @@ MATCHER_CLASSES = {
 }
 
 
+def _migrate_legacy_matchers():
+    global _legacy_migration_checked
+    if _legacy_migration_checked:
+        return
+    _legacy_migration_checked = True
+    config_path = get_data_path("config.json")
+    app_config = {}
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as stream:
+                app_config = __import__("json").load(stream)
+    except (OSError, ValueError):
+        app_config = {}
+    if app_config.get("matcher_settings_migrated"):
+        return
+    legacy_map = load_matcher_config().get("matcher_map", {})
+    stores = load_stores()
+    changed = False
+    for index_name, matcher_name in legacy_map.items():
+        if matcher_name not in MATCHER_CLASSES or "_" not in index_name:
+            continue
+        store_name, supply_type = index_name.rsplit("_", 1)
+        if supply_type in stores.get(store_name, {}):
+            stores[store_name][supply_type]["matcher"] = matcher_name
+            changed = True
+    if changed:
+        save_stores(stores)
+    app_config["matcher_settings_migrated"] = True
+    atomic_write_json(config_path, app_config)
+
+
 def get_matcher_for_store(store_name):
-    config = load_matcher_config()
-    matcher_name = config.get("matcher_map", {}).get(store_name, config.get("default_matcher", "Simple"))
+    _migrate_legacy_matchers()
+    matcher_name = "Simple"
+    if "_" in store_name:
+        actual_store, supply_type = store_name.rsplit("_", 1)
+        matcher_name = get_type_data(actual_store, supply_type).get("matcher", "Simple")
     matcher_class = MATCHER_CLASSES.get(matcher_name)
     
     if matcher_class:

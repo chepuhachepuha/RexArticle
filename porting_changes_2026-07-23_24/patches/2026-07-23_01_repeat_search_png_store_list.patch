@@ -1,0 +1,726 @@
+--- a/matcher.py
++++ b/matcher.py
+@@ -33,7 +33,7 @@
+ class BaseMatcher:
+     """Базовый класс для всех matcher'ов."""
+     
+-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name):
++    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None):
+         raise NotImplementedError("Subclasses must implement find_file_by_article_and_size")
+     
+     def find_file_by_article(self, article, store_name):
+@@ -54,8 +54,20 @@
+                     return override_path
+         return None
+     
+-    def find_with_override(self, article, size_from_pdf, store_name, search_func):
++    def find_with_override(
++        self, article, size_from_pdf, store_name, search_func,
++        allowed_extensions=None,
++    ):
+         matches = search_func(article, size_from_pdf, store_name)
++        if allowed_extensions is not None:
++            normalised_extensions = {
++                extension.lower() if extension.startswith(".") else f".{extension.lower()}"
++                for extension in allowed_extensions
++            }
++            matches = [
++                path for path in matches
++                if os.path.splitext(path)[1].lower() in normalised_extensions
++            ]
+         if matches:
+             return matches
+         
+@@ -74,7 +86,7 @@
+     # Расширения, которые исключаем из поиска
+     EXCLUDED_EXTENSIONS = {'.jpg'}
+     
+-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name):
++    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None):
+         def search_func(art, size, store):
+             index = get_index_for_store(store)
+             if art in index:
+@@ -86,11 +98,14 @@
+                 return filtered_files
+             return []
+         
+-        return self.find_with_override(article, size_from_pdf, store_name, search_func)
++        return self.find_with_override(
++            article, size_from_pdf, store_name, search_func,
++            allowed_extensions=allowed_extensions,
++        )
+ 
+ 
+ class RozenbergMatcher(BaseMatcher):
+-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name):
++    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None):
+         def search_func(art, size, store):
+             index = get_index_for_store(store)
+             clean_article = art.split('-', 1)[0]
+@@ -98,11 +113,14 @@
+                 return index[clean_article]
+             return []
+         
+-        return self.find_with_override(article, size_from_pdf, store_name, search_func)
++        return self.find_with_override(
++            article, size_from_pdf, store_name, search_func,
++            allowed_extensions=allowed_extensions,
++        )
+ 
+ 
+ class AlekseevMatcher(BaseMatcher):
+-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name):
++    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None):
+         def search_func(art, size, store):
+             index = get_index_for_store(store)
+             if art in index:
+@@ -113,11 +131,14 @@
+                 return index[clean_article]
+             return []
+         
+-        return self.find_with_override(article, size_from_pdf, store_name, search_func)
++        return self.find_with_override(
++            article, size_from_pdf, store_name, search_func,
++            allowed_extensions=allowed_extensions,
++        )
+ 
+ 
+ class PdfOnlyMatcher(BaseMatcher):
+-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name):
++    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None):
+         def search_func(art, size, store):
+             index = get_index_for_store(store)
+             if art in index:
+@@ -128,11 +149,14 @@
+                 return pdf_files
+             return []
+         
+-        return self.find_with_override(article, size_from_pdf, store_name, search_func)
++        return self.find_with_override(
++            article, size_from_pdf, store_name, search_func,
++            allowed_extensions=allowed_extensions,
++        )
+ 
+ 
+ class KristabellMatcher(BaseMatcher):
+-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name):
++    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None):
+         def search_func(art, size, store):
+             index = get_index_for_store(store)
+             
+@@ -154,7 +178,10 @@
+                 return index[search_key]
+             return []
+         
+-        return self.find_with_override(article, size_from_pdf, store_name, search_func)
++        return self.find_with_override(
++            article, size_from_pdf, store_name, search_func,
++            allowed_extensions=allowed_extensions,
++        )
+ 
+ 
+ MATCHER_CLASSES = {
+--- a/core/store_manager.py
++++ b/core/store_manager.py
+@@ -45,6 +45,7 @@
+                         "copy_on_override": False,
+                         "override_path": "",
+                         "source": "local",
++                        "png_only": False,
+                     }
+                 }
+             elif isinstance(value, dict) and "path" in value:
+@@ -56,6 +57,7 @@
+                         "copy_on_override": False,
+                         "override_path": "",
+                         "source": "local",
++                        "png_only": False,
+                     }
+                 }
+             else:
+@@ -68,6 +70,7 @@
+                             "copy_on_override": type_data.get("copy_on_override", False),
+                             "override_path": type_data.get("override_path", ""),
+                             "source": type_data.get("source", "local"),
++                            "png_only": bool(type_data.get("png_only", False)),
+                         }
+                 if migrated_store:
+                     new_stores[store_name] = migrated_store
+@@ -104,6 +107,7 @@
+             "copy_on_override": False,
+             "override_path": "",
+             "source": "local",
++            "png_only": False,
+         }
+     }
+     save_stores(stores)
+@@ -127,6 +131,7 @@
+         "copy_on_override": False,
+         "override_path": "",
+         "source": "local",
++        "png_only": False,
+     }
+     save_stores(stores)
+ 
+--- a/gui/main_window.py
++++ b/gui/main_window.py
+@@ -69,6 +69,44 @@
+         options |= QFileDialog.Option.DontUseNativeDialog
+     return options
+ 
++def _sync_not_found_file(output_folder, not_found_items, cancel_token=None):
++    """Atomically make ненайденные.txt reflect one completed search."""
++    not_found_path = os.path.join(output_folder, "ненайденные.txt")
++    temporary_path = not_found_path + ".part"
++
++    if cancel_token:
++        cancel_token.raise_if_cancelled()
++
++    if not not_found_items:
++        try:
++            os.remove(not_found_path)
++        except FileNotFoundError:
++            pass
++        return
++
++    try:
++        with open(temporary_path, "w", encoding="utf-8", newline="") as file:
++            for position, article, size, location in not_found_items:
++                if cancel_token:
++                    cancel_token.raise_if_cancelled()
++                if size and location:
++                    file.write(f"{position}.{article}[{size} {location}]\n")
++                elif size:
++                    file.write(f"{position}.{article}[{size}]\n")
++                else:
++                    file.write(f"{position}.{article}\n")
++            file.flush()
++            os.fsync(file.fileno())
++        if cancel_token:
++            cancel_token.raise_if_cancelled()
++        os.replace(temporary_path, not_found_path)
++    except Exception:
++        try:
++            os.remove(temporary_path)
++        except FileNotFoundError:
++            pass
++        raise
++
+ _WINDOWS_INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+ _WINDOWS_RESERVED_NAMES = {
+     "CON", "PRN", "AUX", "NUL",
+@@ -319,6 +357,8 @@
+         if index_store_name not in self.matcher_cache:
+             self.matcher_cache[index_store_name] = get_matcher_for_store(index_store_name)
+         matcher = self.matcher_cache[index_store_name]
++        type_data = get_type_data(store_name, supply_type)
++        allowed_extensions = {".png"} if type_data.get("png_only", False) else None
+         
+         base_output_folder = os.path.join(self.output_folder, "Найденные_принты_все")
+         os.makedirs(base_output_folder, exist_ok=True)
+@@ -341,7 +381,10 @@
+             size = article_item.size
+             location = article_item.location
+             
+-            matches = matcher.find_file_by_article_and_size(article, size, index_store_name)
++            matches = matcher.find_file_by_article_and_size(
++                article, size, index_store_name,
++                allowed_extensions=allowed_extensions,
++            )
+             
+             if matches:
+                 file = matches[0]
+@@ -381,20 +424,9 @@
+                 not_found_items.append((i + 1, article, size, location))
+                 self.signals.article_status.emit(delivery_item, i, "Не найден")
+         
+-        if not_found_items:
+-            not_found_path = os.path.join(output_folder, "ненайденные.txt")
+-            try:
+-                with open(not_found_path, "w", encoding="utf-8") as f:
+-                    for position, art, size, location in not_found_items:
+-                        if size and location:
+-                            f.write(f"{position}.{art}[{size} {location}]\n")
+-                        elif size:
+-                            f.write(f"{position}.{art}[{size}]\n")
+-                        else:
+-                            f.write(f"{position}.{art}\n")
+-            except Exception as e:
+-                print(f"[ПОИСК] Ошибка создания файла ненайденных: {e}")
+-        
++        _sync_not_found_file(
++            output_folder, not_found_items, cancel_token=self.cancel_token
++        )
+         self.signals.delivery_finished.emit(delivery_item)
+ 
+ 
+@@ -1089,7 +1121,12 @@
+             try:
+                 shutil.rmtree(delivery_item.output_folder)
+             except Exception as e:
+-                print(f"[RESTART] Ошибка удаления папки: {e}")
++                QMessageBox.critical(
++                    self, "Ошибка повторного поиска",
++                    "Не удалось очистить папку предыдущего результата.\n\n"
++                    f"{delivery_item.output_folder}\n\n{e}",
++                )
++                return
+         
+         for i in range(delivery_item.child_count()):
+             self.tree_model.update_article_status(delivery_item, i, "Ожидание")
+@@ -1299,7 +1336,6 @@
+                 delivery_item.store_name,
+             ),
+             self.append_store_to_delivery_folder,
+-            self.shutdown_token,
+         )
+         output_folder = os.path.join(base_output_folder, folder_name)
+         
+--- a/gui/settings_window.py
++++ b/gui/settings_window.py
+@@ -203,6 +203,7 @@
+         self.selected_store = None
+         self.needs_reset_cache = False
+         self.type_vars = {}
++        self.store_buttons = {}
+         self.index_worker = None
+         self.index_dialog = None
+         self.index_thread_pool = QThreadPool.globalInstance()
+@@ -252,13 +253,13 @@
+         sidebar_hint.setObjectName("settingsSidebarHint")
+         left_layout.addWidget(sidebar_hint)
+         
+-        scroll_area = QScrollArea()
+-        scroll_area.setObjectName("storesScroll")
+-        scroll_area.setWidgetResizable(True)
+-        scroll_area.setFrameShape(QFrame.NoFrame)
+-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+-        scroll_area.viewport().setObjectName("storesViewport")
++        self.stores_scroll_area = QScrollArea()
++        self.stores_scroll_area.setObjectName("storesScroll")
++        self.stores_scroll_area.setWidgetResizable(True)
++        self.stores_scroll_area.setFrameShape(QFrame.NoFrame)
++        self.stores_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
++        self.stores_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
++        self.stores_scroll_area.viewport().setObjectName("storesViewport")
+         
+         self.stores_container = QWidget()
+         self.stores_container.setObjectName("storesContainer")
+@@ -267,8 +268,8 @@
+         self.stores_layout.setSpacing(4)
+         self.stores_layout.setAlignment(Qt.AlignTop)
+         
+-        scroll_area.setWidget(self.stores_container)
+-        left_layout.addWidget(scroll_area, stretch=1)
++        self.stores_scroll_area.setWidget(self.stores_container)
++        left_layout.addWidget(self.stores_scroll_area, stretch=1)
+         
+         separator = QFrame()
+         separator.setFrameShape(QFrame.HLine)
+@@ -329,6 +330,7 @@
+         right_layout.addWidget(self.store_subtitle)
+         
+         settings_scroll = QScrollArea()
++        self.settings_scroll = settings_scroll
+         settings_scroll.setObjectName("settingsScroll")
+         settings_scroll.setWidgetResizable(True)
+         settings_scroll.setFrameShape(QFrame.NoFrame)
+@@ -713,75 +715,77 @@
+         for widget in self.findChildren(QWidget):
+             widget.setStyleSheet("")
+     
++    @staticmethod
++    def _restore_scroll_value(scroll_area, value):
++        scroll_bar = scroll_area.verticalScrollBar()
++        scroll_bar.setValue(min(value, scroll_bar.maximum()))
++
++    def _update_store_button_selection(self):
++        for store_name, button in self.store_buttons.items():
++            selected = store_name == self.selected_store
++            if button.property("selected") != selected:
++                button.setProperty("selected", selected)
++                button.style().unpolish(button)
++                button.style().polish(button)
++                button.update()
++
+     def refresh_store_buttons(self):
++        scroll_value = self.stores_scroll_area.verticalScrollBar().value()
++
+         while self.stores_layout.count():
+             item = self.stores_layout.takeAt(0)
+             widget = item.widget()
+             if widget:
+-                # deleteLater() срабатывает только в следующем event loop;
+-                # без отсоединения старая кнопка успевает отрисоваться поверх новой.
+                 widget.hide()
+                 widget.setParent(None)
+                 widget.deleteLater()
+-        
+-        base_style = """
+-            QPushButton {
+-                text-align: left;
+-                padding: 6px 10px;
+-                border: 1px solid #E0E0E0;
+-                border-radius: 4px;
+-                background-color: #FFFFFF;
+-                font-size: 12px;
+-                min-height: 16px;
+-                color: #212121;
+-            }
+-            QPushButton:hover {
+-                background-color: #F5F5F5;
+-                border-color: #BDBDBD;
+-            }
+-        """
+-        
+-        selected_style = """
+-            QPushButton {
+-                text-align: left;
+-                padding: 6px 10px;
+-                border: 1px solid #9E9E9E;
+-                border-radius: 4px;
+-                background-color: #E0E0E0;
+-                font-weight: 600;
+-                font-size: 12px;
+-                min-height: 16px;
+-                color: #212121;
+-            }
+-            QPushButton:hover {
+-                background-color: #D5D5D5;
+-            }
+-        """
+-        
++
++        self.store_buttons = {}
+         for store_name in self.stores.keys():
+             button = QPushButton(self._display_store_name(store_name))
+             button.setFixedHeight(30)
+-            
+             button.setProperty("sidebarItem", True)
+             button.setProperty("selected", store_name == self.selected_store)
+-            
+-            button.clicked.connect(lambda checked, n=store_name: self.select_store(n))
++            button.clicked.connect(
++                lambda checked=False, name=store_name: self.select_store(name)
++            )
++            self.store_buttons[store_name] = button
+             self.stores_layout.addWidget(button)
+-        
++
+         self.stores_layout.addStretch(1)
+-    
++        QTimer.singleShot(
++            0,
++            lambda value=scroll_value: self._restore_scroll_value(
++                self.stores_scroll_area, value
++            ),
++        )
++
+     def select_store(self, store_name):
++        left_scroll_value = self.stores_scroll_area.verticalScrollBar().value()
++        right_scroll_value = self.settings_scroll.verticalScrollBar().value()
+         self.selected_store = store_name
+         self.store_title.setText(
+             f"Настройки: {self._display_store_name(store_name)}"
+         )
+         self.update_store_index_button.setEnabled(True)
+-        
++
+         self.refresh_types_for_store(store_name)
+         self.update_overrides_stats()
+-        self.refresh_store_buttons()
+         self._clear_inline_styles()
+-    
++        self._update_store_button_selection()
++        QTimer.singleShot(
++            0,
++            lambda value=left_scroll_value: self._restore_scroll_value(
++                self.stores_scroll_area, value
++            ),
++        )
++        QTimer.singleShot(
++            0,
++            lambda value=right_scroll_value: self._restore_scroll_value(
++                self.settings_scroll, value
++            ),
++        )
++
+     def refresh_types_for_store(self, store_name):
+         while self.types_layout.count():
+             item = self.types_layout.takeAt(0)
+@@ -826,6 +830,7 @@
+             "copy_on_override": False,
+             "override_path": "",
+             "source": "local",
++            "png_only": False,
+         }
+         self.stores[store_name][supply_type] = values.copy()
+         self.type_vars.setdefault(store_name, {})[supply_type] = values.copy()
+@@ -841,6 +846,7 @@
+                 "copy_on_override": type_data.get("copy_on_override", False),
+                 "override_path": type_data.get("override_path", ""),
+                 "source": type_data.get("source", "local"),
++                "png_only": bool(type_data.get("png_only", False)),
+             }
+         
+         vars_dict = self.type_vars[store_name][supply_type]
+@@ -975,6 +981,18 @@
+         group_layout.addWidget(separator)
+         
+         # Настройки уточнения — ОДИН чекбокс
++        png_only_checkbox = QCheckBox("Искать только PNG")
++        png_only_checkbox.setObjectName("pngOnly")
++        png_only_checkbox.setChecked(bool(vars_dict.get("png_only", False)))
++        png_only_checkbox.setToolTip(
++            "Автоматический поиск будет учитывать только файлы PNG. "
++            "Ручные уточнения других форматов останутся доступными."
++        )
++        png_only_checkbox.toggled.connect(
++            lambda checked, st=supply_type: self._on_png_only_toggled(st, checked)
++        )
++        group_layout.addWidget(png_only_checkbox)
++
+         override_title = QLabel("Настройки уточнения:")
+         override_title.setStyleSheet("font-weight: 600; font-size: 12px;")
+         group_layout.addWidget(override_title)
+@@ -1060,6 +1078,12 @@
+     # Обработчики изменений
+     # ============================================
+     
++    def _on_png_only_toggled(self, supply_type, checked):
++        store_name = self.selected_store
++        if store_name in self.type_vars and supply_type in self.type_vars[store_name]:
++            self.type_vars[store_name][supply_type]["png_only"] = bool(checked)
++            self._auto_save()
++
+     def _on_copy_toggled(self, supply_type, checked):
+         store_name = self.selected_store
+         if store_name in self.type_vars and supply_type in self.type_vars[store_name]:
+@@ -1096,6 +1120,7 @@
+                     "copy_on_override": vars_dict["copy_on_override"],
+                     "override_path": vars_dict["override_path"].strip(),
+                     "source": vars_dict.get("source", "local"),
++                    "png_only": bool(vars_dict.get("png_only", False)),
+                 }
+         
+         for supply_type in set(list(old_store_data.keys()) + list(new_store_data.keys())):
+--- /dev/null
++++ b/tests/test_search_and_settings.py
+@@ -0,0 +1,216 @@
++import os
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++from PySide6.QtWidgets import QApplication
++
++from core.cancellation import CancellationToken, OperationCancelled
++from gui.main_window import _sync_not_found_file
++from matcher import SimpleMatcher
++
++
++class NotFoundFileTests(unittest.TestCase):
++    def test_file_is_atomically_created_and_replaced(self):
++        with tempfile.TemporaryDirectory() as directory:
++            output = Path(directory)
++            _sync_not_found_file(
++                str(output),
++                [(1, "A-1", "M", "СПИНА"), (2, "B-2", "", "")],
++            )
++            result = output / "ненайденные.txt"
++            self.assertEqual(
++                result.read_text(encoding="utf-8"),
++                "1.A-1[M СПИНА]\n2.B-2\n",
++            )
++            self.assertFalse((output / "ненайденные.txt.part").exists())
++
++            _sync_not_found_file(str(output), [(3, "C-3", "XL", "")])
++            self.assertEqual(result.read_text(encoding="utf-8"), "3.C-3[XL]\n")
++            self.assertFalse((output / "ненайденные.txt.part").exists())
++
++    def test_empty_result_removes_stale_file_idempotently(self):
++        with tempfile.TemporaryDirectory() as directory:
++            result = Path(directory) / "ненайденные.txt"
++            result.write_text("stale", encoding="utf-8")
++            _sync_not_found_file(directory, [])
++            _sync_not_found_file(directory, [])
++            self.assertFalse(result.exists())
++
++    def test_cancellation_preserves_previous_file(self):
++        with tempfile.TemporaryDirectory() as directory:
++            output = Path(directory)
++            result = output / "ненайденные.txt"
++            result.write_text("previous", encoding="utf-8")
++            token = CancellationToken()
++            token.cancel()
++            with self.assertRaises(OperationCancelled):
++                _sync_not_found_file(
++                    directory, [(1, "NEW", "", "")], cancel_token=token
++                )
++            self.assertEqual(result.read_text(encoding="utf-8"), "previous")
++            self.assertFalse((output / "ненайденные.txt.part").exists())
++
++
++class MatcherExtensionFilterTests(unittest.TestCase):
++    def test_png_filter_is_case_insensitive_and_filters_before_selection(self):
++        index = {"A": [r"C:\prints\A.pdf", r"C:\prints\A.PNG", r"C:\prints\A.png"]}
++        with patch("matcher.get_index_for_store", return_value=index), patch(
++            "matcher.get_override", return_value=None
++        ):
++            result = SimpleMatcher().find_file_by_article_and_size(
++                "A", "", "Shop_WB", allowed_extensions={".png"}
++            )
++        self.assertEqual(
++            result, [r"C:\prints\A.PNG", r"C:\prints\A.png"]
++        )
++
++    def test_non_png_manual_override_is_allowed(self):
++        with tempfile.TemporaryDirectory() as directory:
++            override = Path(directory) / "manual.tif"
++            override.write_bytes(b"manual")
++            index = {"A": [r"C:\prints\A.pdf"]}
++            with patch("matcher.get_index_for_store", return_value=index), patch(
++                "matcher.get_override", return_value=str(override)
++            ):
++                result = SimpleMatcher().find_file_by_article_and_size(
++                    "A", "", "Shop_WB", allowed_extensions={"png"}
++                )
++            self.assertEqual(result, [str(override)])
++
++    def test_omitted_filter_preserves_existing_behavior(self):
++        index = {"A": [r"C:\prints\A.pdf", r"C:\prints\A.png"]}
++        with patch("matcher.get_index_for_store", return_value=index), patch(
++            "matcher.get_override", return_value=None
++        ):
++            result = SimpleMatcher().find_file_by_article_and_size(
++                "A", "", "Shop_WB"
++            )
++        self.assertEqual(result, index["A"])
++
++
++class SettingsWindowTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.app = QApplication.instance() or QApplication([])
++
++    def _stores(self, count=30):
++        return {
++            f"Store {number:02d}": {
++                "WB": {
++                    "path": "",
++                    "copy_on_override": False,
++                    "override_path": "",
++                    "source": "local",
++                    "png_only": False,
++                },
++                "OZON": {
++                    "path": "",
++                    "copy_on_override": False,
++                    "override_path": "",
++                    "source": "local",
++                    "png_only": False,
++                },
++            }
++            for number in range(count)
++        }
++
++    def test_selecting_store_keeps_sidebar_scroll_and_button_instances(self):
++        import gui.settings_window as settings_module
++
++        stores = self._stores()
++        with tempfile.TemporaryDirectory() as directory, patch.object(
++            settings_module, "load_stores", return_value=stores
++        ), patch.object(
++            settings_module, "get_data_path",
++            side_effect=lambda name: str(Path(directory) / name),
++        ), patch.object(
++            settings_module, "OVERRIDES_FILE", str(Path(directory) / "overrides.json")
++        ), patch.object(settings_module, "save_stores"):
++            window = settings_module.SettingsWindow()
++            try:
++                window.resize(760, 380)
++                window.show()
++                self.app.processEvents()
++                scroll_bar = window.stores_scroll_area.verticalScrollBar()
++                self.assertGreater(scroll_bar.maximum(), 0)
++                scroll_bar.setValue(scroll_bar.maximum() // 2)
++                self.app.processEvents()
++                expected_scroll = scroll_bar.value()
++                previous_buttons = dict(window.store_buttons)
++
++                window.select_store("Store 25")
++                self.app.processEvents()
++
++                self.assertEqual(scroll_bar.value(), expected_scroll)
++                self.assertEqual(set(window.store_buttons), set(previous_buttons))
++                for name, button in previous_buttons.items():
++                    self.assertIs(window.store_buttons[name], button)
++            finally:
++                window.close()
++                self.app.processEvents()
++
++    def test_png_only_is_saved_independently_for_wb_and_ozon(self):
++        import gui.settings_window as settings_module
++
++        stores = self._stores(count=1)
++        with tempfile.TemporaryDirectory() as directory, patch.object(
++            settings_module, "load_stores", return_value=stores
++        ), patch.object(
++            settings_module, "get_data_path",
++            side_effect=lambda name: str(Path(directory) / name),
++        ), patch.object(
++            settings_module, "OVERRIDES_FILE", str(Path(directory) / "overrides.json")
++        ), patch.object(settings_module, "save_stores") as save_mock:
++            window = settings_module.SettingsWindow()
++            try:
++                window._on_png_only_toggled("WB", True)
++                self.assertTrue(window.stores["Store 00"]["WB"]["png_only"])
++                self.assertFalse(window.stores["Store 00"]["OZON"]["png_only"])
++                self.assertTrue(save_mock.called)
++            finally:
++                window.close()
++                self.app.processEvents()
++
++
++class RestartSearchTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.app = QApplication.instance() or QApplication([])
++
++    def test_cleanup_failure_blocks_restart_before_state_changes(self):
++        from types import SimpleNamespace
++        import gui.main_window as main_module
++
++        window = main_module.MainWindow()
++        delivery = SimpleNamespace(
++            output_folder=r"C:\locked\delivery",
++            pdf_path=r"C:\pdf\delivery.pdf",
++        )
++        try:
++            with patch.object(
++                main_module.QMessageBox,
++                "question",
++                return_value=main_module.QMessageBox.Yes,
++            ), patch.object(
++                main_module.QMessageBox, "critical"
++            ) as critical, patch.object(
++                main_module.os.path, "exists", return_value=True
++            ), patch.object(
++                main_module.shutil, "rmtree", side_effect=PermissionError("locked")
++            ):
++                window.on_restart_clicked(delivery)
++
++            critical.assert_called_once()
++            self.assertFalse(window.is_searching)
++            self.assertIsNone(window._pending_restart_item)
++        finally:
++            window.cloud_auto_timer.stop()
++            window.deleteLater()
++            self.app.processEvents()
++
++if __name__ == "__main__":
++    unittest.main()

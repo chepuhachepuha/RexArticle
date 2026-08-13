@@ -32,6 +32,13 @@ def load_stores():
             needs_migration = True
         elif isinstance(value, dict) and "path" in value:
             needs_migration = True
+        elif isinstance(value, dict):
+            for type_data in value.values():
+                if isinstance(type_data, dict) and (
+                    "matcher" not in type_data or "png_only" not in type_data
+                ):
+                    needs_migration = True
+                    break
     
     if needs_migration:
         new_stores = {}
@@ -44,6 +51,7 @@ def load_stores():
                         "copy_on_override": False,
                         "override_path": "",
                         "source": "local",
+                        "png_only": False,
                     }
                 }
             elif isinstance(value, dict) and "path" in value:
@@ -55,6 +63,7 @@ def load_stores():
                         "copy_on_override": False,
                         "override_path": "",
                         "source": "local",
+                        "png_only": False,
                     }
                 }
             else:
@@ -67,6 +76,7 @@ def load_stores():
                             "copy_on_override": type_data.get("copy_on_override", False),
                             "override_path": type_data.get("override_path", ""),
                             "source": type_data.get("source", "local"),
+                            "png_only": bool(type_data.get("png_only", False)),
                         }
                 if migrated_store:
                     new_stores[store_name] = migrated_store
@@ -104,6 +114,7 @@ def add_store(store_name):
             "copy_on_override": False,
             "override_path": "",
             "source": "local",
+            "png_only": False,
         }
     }
     save_stores(stores)
@@ -127,6 +138,7 @@ def add_type(store_name, supply_type):
         "copy_on_override": False,
         "override_path": "",
         "source": "local",
+        "png_only": False,
     }
     save_stores(stores)
 

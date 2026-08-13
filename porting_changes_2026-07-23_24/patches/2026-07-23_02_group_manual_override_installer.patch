@@ -1,0 +1,349 @@
+--- a/manual_overrides.py
++++ b/manual_overrides.py
+@@ -53,14 +53,21 @@
+     sub_key = _build_sub_key(article, size)
+     return overrides.get(key, {}).get(sub_key)
+ 
+-def set_override(store_name, supply_type, article, size, file_path):
++def set_overrides(store_name, supply_type, article_sizes, file_path):
++    """Atomically bind one file to several article/size override keys."""
++    pairs = list(article_sizes)
++    if not pairs:
++        return
++
+     overrides = _load_to_cache()
+     key = _build_key(store_name, supply_type)
+-    sub_key = _build_sub_key(article, size)
+-    if key not in overrides:
+-        overrides[key] = {}
+-    overrides[key][sub_key] = file_path
++    store_overrides = overrides.setdefault(key, {})
++    for article, size in pairs:
++        store_overrides[_build_sub_key(article, size)] = file_path
+     save_overrides(overrides)
++
++def set_override(store_name, supply_type, article, size, file_path):
++    set_overrides(store_name, supply_type, [(article, size)], file_path)
+ 
+ def remove_override(store_name, supply_type, article, size):
+     overrides = _load_to_cache()
+--- a/gui/main_window.py
++++ b/gui/main_window.py
+@@ -31,7 +31,7 @@
+     update_yandex_indexes,
+ )
+ from matcher import get_matcher_for_store
+-from manual_overrides import get_override, set_override
++from manual_overrides import get_override, set_override, set_overrides
+ 
+ 
+ # ============================================
+@@ -57,6 +57,34 @@
+     if value and os.path.isdir(value):
+         return value
+     return _system_desktop_path()
++
++def _override_dialog_directory(store_path, delivery_folder):
++    """Return the first existing physical folder suitable for file selection."""
++    candidates = [
++        store_path,
++        delivery_folder,
++        QStandardPaths.writableLocation(
++            QStandardPaths.StandardLocation.DocumentsLocation
++        ),
++        os.path.expanduser("~"),
++    ]
++    for candidate in candidates:
++        value = os.path.normpath(
++            os.path.expandvars(os.path.expanduser(str(candidate or "").strip()))
++        )
++        if value and os.path.isdir(value):
++            return value
++    return os.path.normpath(os.path.expanduser("~"))
++
++
++def _matching_article_indices(delivery_item, article):
++    """Return every row in this delivery with the same trimmed article."""
++    target = str(article or "").strip()
++    return [
++        index
++        for index in range(delivery_item.child_count())
++        if str(delivery_item.child(index).article or "").strip() == target
++    ]
+ 
+ def _output_directory_dialog_options():
+     """Use filesystem-only folder selection on Windows.
+@@ -917,6 +945,24 @@
+     # Override
+     # ============================================
+     
++    def _remember_override_for_article(
++        self, delivery_item, article, file_path, status
++    ):
++        matching_indices = _matching_article_indices(delivery_item, article)
++        article_sizes = [
++            (delivery_item.child(index).article, delivery_item.child(index).size)
++            for index in matching_indices
++        ]
++        set_overrides(
++            delivery_item.store_name,
++            delivery_item.supply_type,
++            article_sizes,
++            file_path,
++        )
++        for index in matching_indices:
++            self.tree_model.update_article_status(delivery_item, index, status)
++        return len(matching_indices)
++
+     def on_override_clicked(self, delivery_item, article_index):
+         """
+         Обработка клика по кнопке 'Уточнить' для артикула.
+@@ -946,21 +992,29 @@
+                     "Яндекс Диск временно недоступен в Windows-версии."
+                 )
+                 return
+-            picker = YandexDiskPickerDialog(select_file=True, parent=self)
++            picker = YandexDiskPickerDialog(
++                select_file=True,
++                initial_path=type_data.get("path", ""),
++                parent=self,
++            )
+             if picker.exec() != QDialog.Accepted:
+                 return
+-            set_override(store_name, supply_type, article, size, picker.selected_path)
+-            self.tree_model.update_article_status(
+-                delivery_item, article_index, "Уточнён (Яндекс Диск)"
++            linked_count = self._remember_override_for_article(
++                delivery_item, article, picker.selected_path,
++                "Уточнён (Яндекс Диск)",
+             )
+             QMessageBox.information(
+-                self, "Успех", "Облачный файл привязан к артикулу."
+-            )
+-            return
+-
++                self, "Успех",
++                f"Облачный файл привязан к {linked_count} поз.",
++            )
++            return
++
++        initial_directory = _override_dialog_directory(
++            type_data.get("path", ""), delivery_item.folder
++        )
+         file_path, _ = QFileDialog.getOpenFileName(
+-            self, f"Укажите путь артикула {article}", "",
+-            "Изображения (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp);;Все файлы (*.*)"
++            self, f"Укажите путь артикула {article}", initial_directory,
++            "Изображения (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp);;Все файлы (*.*)"
+         )
+         if not file_path:
+             return
+@@ -971,9 +1025,13 @@
+         
+         if not copy_on_override:
+             # === Режим "Только запомнить путь" ===
+-            set_override(store_name, supply_type, article, size, file_path)
+-            QMessageBox.information(self, "Успех", f"Путь сохранён:\n{file_path}")
+-            self.tree_model.update_article_status(delivery_item, article_index, "Уточнён (override)")
++            linked_count = self._remember_override_for_article(
++                delivery_item, article, file_path, "Уточнён (override)"
++            )
++            QMessageBox.information(
++                self, "Успех",
++                f"Путь сохранён для {linked_count} поз.:\n{file_path}",
++            )
+             return
+         
+         # === Режим "Копировать и переименовывать" ===
+--- a/tests/test_search_and_settings.py
++++ b/tests/test_search_and_settings.py
+@@ -2,14 +2,20 @@
+ import tempfile
+ import unittest
+ from pathlib import Path
+-from unittest.mock import patch
++from types import MethodType, SimpleNamespace
++from unittest.mock import Mock, patch
+ 
+ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+ 
+ from PySide6.QtWidgets import QApplication
+ 
+ from core.cancellation import CancellationToken, OperationCancelled
+-from gui.main_window import _sync_not_found_file
++from gui.main_window import (
++    MainWindow,
++    _matching_article_indices,
++    _override_dialog_directory,
++    _sync_not_found_file,
++)
+ from matcher import SimpleMatcher
+ 
+ 
+@@ -54,6 +60,155 @@
+             self.assertEqual(result.read_text(encoding="utf-8"), "previous")
+             self.assertFalse((output / "ненайденные.txt.part").exists())
+ 
++
++class OverrideInteractionTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.app = QApplication.instance() or QApplication([])
++
++    def test_store_folder_and_fallback_order(self):
++        import gui.main_window as main_module
++
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            store = root / "store"
++            delivery = root / "delivery"
++            documents = root / "documents"
++            store.mkdir()
++            delivery.mkdir()
++            documents.mkdir()
++
++            with patch.dict(os.environ, {"REX_STORE_TEST": str(store)}):
++                self.assertEqual(
++                    _override_dialog_directory("%REX_STORE_TEST%", str(delivery)),
++                    os.path.normpath(str(store)),
++                )
++            self.assertEqual(
++                _override_dialog_directory(str(root / "missing"), str(delivery)),
++                os.path.normpath(str(delivery)),
++            )
++            with patch.object(
++                main_module.QStandardPaths, "writableLocation", return_value=str(documents)
++            ):
++                self.assertEqual(
++                    _override_dialog_directory("missing", "also-missing"),
++                    os.path.normpath(str(documents)),
++                )
++
++    def test_home_is_final_fallback(self):
++        import gui.main_window as main_module
++
++        home = os.path.normpath(os.path.expanduser("~"))
++        with patch.object(
++            main_module.QStandardPaths, "writableLocation", return_value=""
++        ), patch.object(
++            main_module.os.path, "isdir", side_effect=lambda path: path == home
++        ):
++            self.assertEqual(
++                _override_dialog_directory("missing", "also-missing"), home
++            )
++
++    def test_matching_article_ignores_size_location_and_edge_spaces(self):
++        children = [
++            SimpleNamespace(article=" ART-1 ", size="S", location=""),
++            SimpleNamespace(article="ART-1", size="XL", location="СПИНА"),
++            SimpleNamespace(article="ART-2", size="S", location=""),
++        ]
++        delivery = SimpleNamespace(
++            child_count=lambda: len(children),
++            child=lambda index: children[index],
++        )
++        self.assertEqual(_matching_article_indices(delivery, "ART-1"), [0, 1])
++
++    def test_one_dialog_saves_all_sizes_and_updates_all_duplicate_rows(self):
++        import gui.main_window as main_module
++
++        children = [
++            SimpleNamespace(article=" ART-1 ", size="S", location=""),
++            SimpleNamespace(article="ART-1", size="XL", location="СПИНА"),
++            SimpleNamespace(article="ART-1", size="S", location=""),
++            SimpleNamespace(article="ART-2", size="S", location=""),
++        ]
++        delivery = SimpleNamespace(
++            store_name="Shop",
++            supply_type="WB",
++            folder="",
++            child_count=lambda: len(children),
++            child=lambda index: children[index],
++        )
++        fake_window = SimpleNamespace(tree_model=SimpleNamespace(
++            update_article_status=Mock()
++        ))
++        fake_window._remember_override_for_article = MethodType(
++            MainWindow._remember_override_for_article, fake_window
++        )
++
++        with tempfile.TemporaryDirectory() as directory:
++            selected = str(Path(directory) / "selected.tif")
++            Path(selected).write_bytes(b"selected")
++            with patch.object(
++                main_module, "get_type_data",
++                return_value={
++                    "source": "local",
++                    "path": directory,
++                    "copy_on_override": False,
++                },
++            ), patch.object(
++                main_module.QFileDialog, "getOpenFileName",
++                return_value=(selected, ""),
++            ) as dialog, patch.object(
++                main_module, "set_overrides"
++            ) as batch_save, patch.object(
++                main_module.QMessageBox, "information"
++            ):
++                MainWindow.on_override_clicked(fake_window, delivery, 0)
++
++            self.assertEqual(dialog.call_count, 1)
++            self.assertEqual(dialog.call_args.args[2], os.path.normpath(directory))
++            batch_save.assert_called_once_with(
++                "Shop", "WB",
++                [(" ART-1 ", "S"), ("ART-1", "XL"), ("ART-1", "S")],
++                selected,
++            )
++            updated_indices = [
++                call.args[1]
++                for call in fake_window.tree_model.update_article_status.call_args_list
++            ]
++            self.assertEqual(updated_indices, [0, 1, 2])
++
++
++class ManualOverrideBatchTests(unittest.TestCase):
++    def test_batch_save_writes_all_sizes_once_without_schema_change(self):
++        import json
++        import manual_overrides as overrides_module
++
++        with tempfile.TemporaryDirectory() as directory:
++            overrides_file = str(Path(directory) / "manual_overrides.json")
++            overrides_module.invalidate_cache()
++            try:
++                with patch.object(
++                    overrides_module, "OVERRIDES_FILE", overrides_file
++                ), patch.object(
++                    overrides_module, "atomic_write_json",
++                    wraps=overrides_module.atomic_write_json,
++                ) as atomic_write:
++                    overrides_module.set_overrides(
++                        "Shop", "WB",
++                        [("ART-1", "S"), ("ART-1", "XL"), ("ART-1", "S")],
++                        r"C:\prints\ART-1.tif",
++                    )
++                    self.assertEqual(atomic_write.call_count, 1)
++
++                data = json.loads(Path(overrides_file).read_text(encoding="utf-8"))
++                self.assertEqual(
++                    data["Shop_WB"],
++                    {
++                        "ART-1_S": r"C:\prints\ART-1.tif",
++                        "ART-1_XL": r"C:\prints\ART-1.tif",
++                    },
++                )
++            finally:
++                overrides_module.invalidate_cache()
+ 
+ class MatcherExtensionFilterTests(unittest.TestCase):
+     def test_png_filter_is_case_insensitive_and_filters_before_selection(self):
+--- a/RexArticles.iss
++++ b/RexArticles.iss
+@@ -32,7 +32,7 @@
+ Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"; GroupDescription: "Дополнительные значки:"; Flags: unchecked
+ 
+ [Files]
+-Source: "dist\RexArticles\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
++Source: "dist\RexArticles\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "config.json,stores.json,manual_overrides.json"
+ 
+ [Icons]
+ Name: "{group}\RexArticles"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"

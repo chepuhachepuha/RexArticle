@@ -1,0 +1,512 @@
+--- /dev/null
++++ b/core/personalization.py
+@@ -0,0 +1,24 @@
++"""Shared helpers for personalization settings."""
++
++
++def normalise_store_suffix_exclusions(value):
++    """Return valid internal store names as a set."""
++    if not isinstance(value, (list, tuple, set, frozenset)):
++        return set()
++    return {
++        name
++        for name in value
++        if isinstance(name, str) and name
++    }
++
++
++def should_append_store_suffix(
++    store_name,
++    append_enabled,
++    excluded_store_names=None,
++):
++    """Return whether a delivery folder should receive the store suffix."""
++    if not append_enabled or not store_name:
++        return False
++    exclusions = normalise_store_suffix_exclusions(excluded_store_names)
++    return store_name not in exclusions--- a/gui/main_window.py
++++ b/gui/main_window.py
+@@ -16,6 +16,10 @@
+ from core.paths import get_data_path
+ from core.json_storage import atomic_write_json
+ from core.cancellation import CancellationToken, OperationCancelled
++from core.personalization import (
++    normalise_store_suffix_exclusions,
++    should_append_store_suffix,
++)
+ from gui.widgets.supply_tree import SupplyTreeView, SupplyTreeModel, SupplyDeliveryItem
+ from gui.widgets.override_delegate import OverrideButtonDelegate
+ from gui.dialogs.parse_progress_dialog import ParseProgressDialog
+@@ -354,6 +358,7 @@
+         matcher_cache,
+         append_store_name=False,
+         cancel_token=None,
++        store_suffix_exclusions=None,
+     ):
+         super().__init__()
+         self.setAutoDelete(True)
+@@ -362,6 +367,9 @@
+         self.matcher_cache = matcher_cache
+         self.append_store_name = append_store_name
+         self.cancel_token = cancel_token
++        self.store_suffix_exclusions = normalise_store_suffix_exclusions(
++            store_suffix_exclusions
++        )
+         self.signals = SearchSignals()
+     
+     @Slot()
+@@ -394,7 +402,11 @@
+         folder_name = _delivery_output_folder_name(
+             delivery_item.pdf_path,
+             getattr(delivery_item, "display_store_name", store_name),
+-            self.append_store_name,
++            should_append_store_suffix(
++                store_name,
++                self.append_store_name,
++                self.store_suffix_exclusions,
++            ),
+         )
+         output_folder = os.path.join(base_output_folder, folder_name)
+         os.makedirs(output_folder, exist_ok=True)
+@@ -584,6 +596,9 @@
+         self.append_store_to_delivery_folder = bool(config.get(
+             "personalization_append_store_to_delivery_folder", False
+         ))
++        self.store_suffix_exclusions = normalise_store_suffix_exclusions(
++            config.get("personalization_store_suffix_exclusions", [])
++        )
+         self.store_display_names = dict(
+             config.get("store_display_names", {}) or {}
+         )
+@@ -611,6 +626,10 @@
+             "personalization_open_results_folder": self.open_results_folder,
+             "personalization_append_store_to_delivery_folder": (
+                 self.append_store_to_delivery_folder
++            ),
++            "personalization_store_suffix_exclusions": sorted(
++                self.store_suffix_exclusions,
++                key=str.casefold,
+             ),
+             "store_display_names": self.store_display_names,
+         })
+@@ -1262,6 +1281,7 @@
+             self.matcher_cache,
+             self.append_store_to_delivery_folder,
+             self.shutdown_token,
++            store_suffix_exclusions=self.store_suffix_exclusions,
+         )
+         worker.signals.article_status.connect(self._on_article_status)
+         worker.signals.article_copied.connect(self._on_article_copied)
+@@ -1370,6 +1390,7 @@
+             self.matcher_cache,
+             self.append_store_to_delivery_folder,
+             self.shutdown_token,
++            store_suffix_exclusions=self.store_suffix_exclusions,
+         )
+         worker.signals.article_status.connect(self._on_article_status)
+         worker.signals.article_copied.connect(self._on_article_copied)
+@@ -1393,7 +1414,11 @@
+                 "display_store_name",
+                 delivery_item.store_name,
+             ),
+-            self.append_store_to_delivery_folder,
++            should_append_store_suffix(
++                delivery_item.store_name,
++                self.append_store_to_delivery_folder,
++                self.store_suffix_exclusions,
++            ),
+         )
+         output_folder = os.path.join(base_output_folder, folder_name)
+         
+--- a/gui/settings_window.py
++++ b/gui/settings_window.py
+@@ -18,6 +18,7 @@
+ from core.store_manager import load_stores, save_stores
+ from core.paths import get_data_path
+ from core.json_storage import atomic_write_json
++from core.personalization import normalise_store_suffix_exclusions
+ from indexer import (
+     remove_index_for_store,
+     update_index_for_store,
+@@ -185,6 +186,72 @@
+         self.status_label.setText("Готово")
+ 
+ 
++class StoreSuffixExclusionsDialog(QDialog):
++    """Select stores that must not be appended to delivery folder names."""
++
++    def __init__(
++        self,
++        stores,
++        display_name,
++        selected_store_names=None,
++        parent=None,
++    ):
++        super().__init__(parent)
++        self.setWindowTitle("Не подписывать магазины")
++        self.resize(520, 460)
++        self._checkboxes = {}
++        selected = normalise_store_suffix_exclusions(selected_store_names)
++
++        layout = QVBoxLayout(self)
++        hint = QLabel(
++            "Отметьте магазины, название которых не нужно добавлять "
++            "в квадратных скобках к папке поставки."
++        )
++        hint.setWordWrap(True)
++        layout.addWidget(hint)
++
++        scroll = QScrollArea(self)
++        scroll.setWidgetResizable(True)
++        container = QWidget(scroll)
++        stores_layout = QVBoxLayout(container)
++
++        for store_name in stores:
++            visible_name = display_name(store_name)
++            label = (
++                visible_name
++                if visible_name == store_name
++                else f"{visible_name} ({store_name})"
++            )
++            checkbox = QCheckBox(label, container)
++            checkbox.setChecked(store_name in selected)
++            self._checkboxes[store_name] = checkbox
++            stores_layout.addWidget(checkbox)
++
++        if not self._checkboxes:
++            empty_label = QLabel("Настроенных магазинов пока нет", container)
++            empty_label.setObjectName("settingsSubtitle")
++            stores_layout.addWidget(empty_label)
++
++        stores_layout.addStretch()
++        scroll.setWidget(container)
++        layout.addWidget(scroll)
++
++        buttons = QDialogButtonBox(
++            QDialogButtonBox.StandardButton.Save
++            | QDialogButtonBox.StandardButton.Cancel,
++            parent=self,
++        )
++        buttons.accepted.connect(self.accept)
++        buttons.rejected.connect(self.reject)
++        layout.addWidget(buttons)
++
++    def selected_store_names(self):
++        return {
++            store_name
++            for store_name, checkbox in self._checkboxes.items()
++            if checkbox.isChecked()
++        }
++
+ class SettingsWindow(QDialog):
+     """Окно настроек магазинов с авто-сохранением."""
+     
+@@ -199,6 +266,9 @@
+         self.app_config = self._load_app_config()
+         self.store_display_names = dict(
+             self.app_config.get("store_display_names", {}) or {}
++        )
++        self.store_suffix_exclusions = normalise_store_suffix_exclusions(
++            self.app_config.get("personalization_store_suffix_exclusions", [])
+         )
+         self.selected_store = None
+         self.needs_reset_cache = False
+@@ -470,7 +540,15 @@
+                 "personalization_append_store_to_delivery_folder", False
+             )
+         ))
+-        behavior_layout.addWidget(self.append_store_name_checkbox)
++        store_suffix_layout = QHBoxLayout()
++        store_suffix_layout.addWidget(self.append_store_name_checkbox, 1)
++        self.store_suffix_exclusions_button = QPushButton()
++        self.store_suffix_exclusions_button.clicked.connect(
++            self._edit_store_suffix_exclusions
++        )
++        store_suffix_layout.addWidget(self.store_suffix_exclusions_button)
++        behavior_layout.addLayout(store_suffix_layout)
++        self._update_store_suffix_exclusions_button()
+ 
+         self.store_names_button = QPushButton("Названия магазинов")
+         self.store_names_button.clicked.connect(self._edit_store_display_names)
+@@ -489,13 +567,57 @@
+             self.append_store_name_checkbox,
+         ):
+             checkbox.toggled.connect(self._save_personalization_settings)
++        self.append_store_name_checkbox.toggled.connect(
++            self._update_store_suffix_exclusions_button
++        )
+         return tab
+ 
+     def _display_store_name(self, store_name):
+         display_name = str(self.store_display_names.get(store_name, "")).strip()
+         return display_name or store_name
+-
++    def _update_store_suffix_exclusions_button(self, *_):
++        valid_exclusions = self.store_suffix_exclusions.intersection(self.stores)
++        count = len(valid_exclusions)
++        text = "Кроме…" if count == 0 else f"Кроме… ({count})"
++        self.store_suffix_exclusions_button.setText(text)
++        self.store_suffix_exclusions_button.setEnabled(
++            self.append_store_name_checkbox.isChecked()
++        )
++
++    def _edit_store_suffix_exclusions(self):
++        dialog = StoreSuffixExclusionsDialog(
++            self.stores,
++            self._display_store_name,
++            self.store_suffix_exclusions,
++            self,
++        )
++        if dialog.exec() != QDialog.DialogCode.Accepted:
++            return
++
++        selected = dialog.selected_store_names()
++        config = self._load_app_config()
++        config["personalization_store_suffix_exclusions"] = [
++            store_name
++            for store_name in self.stores
++            if store_name in selected
++        ]
++        try:
++            atomic_write_json(self.config_file, config)
++        except OSError as error:
++            QMessageBox.critical(
++                self,
++                "Ошибка",
++                f"Не удалось сохранить исключения магазинов: {error}",
++            )
++            return
++
++        self.app_config = config
++        self.store_suffix_exclusions = set(
++            config["personalization_store_suffix_exclusions"]
++        )
++        self._update_store_suffix_exclusions_button()
+     def _open_logs(self):
++
+         from gui.dialogs.log_window import LogWindow
+ 
+         LogWindow(self).exec()
+@@ -584,6 +706,11 @@
+             "personalization_append_store_to_delivery_folder": (
+                 self.append_store_name_checkbox.isChecked()
+             ),
++            "personalization_store_suffix_exclusions": [
++                store_name
++                for store_name in self.stores
++                if store_name in self.store_suffix_exclusions
++            ],
+         })
+         try:
+             atomic_write_json(self.config_file, self.app_config)
+--- a/tests/test_search_and_settings.py
++++ b/tests/test_search_and_settings.py
+@@ -1,4 +1,5 @@
+ import os
++import json
+ import tempfile
+ import unittest
+ from pathlib import Path
+@@ -7,16 +8,21 @@
+ 
+ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+ 
+-from PySide6.QtWidgets import QApplication
++from PySide6.QtWidgets import QApplication, QDialog
+ 
+ from core.cancellation import CancellationToken, OperationCancelled
+ from gui.main_window import (
+     MainWindow,
++    _delivery_output_folder_name,
+     _matching_article_indices,
+     _override_dialog_directory,
+     _sync_not_found_file,
+ )
+ from matcher import SimpleMatcher
++from core.personalization import (
++    normalise_store_suffix_exclusions,
++    should_append_store_suffix,
++)
+ 
+ 
+ class NotFoundFileTests(unittest.TestCase):
+@@ -367,5 +373,169 @@
+             window.deleteLater()
+             self.app.processEvents()
+ 
++class StoreSuffixPersonalizationTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.app = QApplication.instance() or QApplication([])
++
++    def test_old_and_invalid_config_values_default_to_no_exclusions(self):
++        self.assertEqual(normalise_store_suffix_exclusions(None), set())
++        self.assertEqual(normalise_store_suffix_exclusions("Store"), set())
++        self.assertEqual(normalise_store_suffix_exclusions({"Store": True}), set())
++        self.assertEqual(
++            normalise_store_suffix_exclusions(["Store", 1, "", "Other"]),
++            {"Store", "Other"},
++        )
++
++    def test_suffix_uses_internal_store_name_and_display_alias(self):
++        self.assertFalse(
++            should_append_store_suffix("Internal", True, {"Internal"})
++        )
++        excluded_name = _delivery_output_folder_name(
++            r"C:\input\delivery.pdf",
++            "Visible alias",
++            should_append_store_suffix("Internal", True, {"Internal"}),
++        )
++        included_name = _delivery_output_folder_name(
++            r"C:\input\delivery.pdf",
++            "Visible alias",
++            should_append_store_suffix("Internal", True, {"Other"}),
++        )
++        globally_disabled = _delivery_output_folder_name(
++            r"C:\input\delivery.pdf",
++            "Visible alias",
++            should_append_store_suffix("Internal", False, set()),
++        )
++        self.assertEqual(excluded_name, "delivery")
++        self.assertEqual(globally_disabled, "delivery")
++        self.assertEqual(included_name, "delivery [Visible alias]")
++        self.assertTrue(
++            should_append_store_suffix("Unknown", True, {"Internal"})
++        )
++
++    def _open_settings(self, directory, config):
++        import gui.settings_window as settings_module
++
++        config_path = Path(directory) / "config.json"
++        config_path.write_text(json.dumps(config), encoding="utf-8")
++        stores = {
++            "Store 00": {"WB": {"path": "", "source": "local"}},
++            "Store 01": {"WB": {"path": "", "source": "local"}},
++        }
++        patches = (
++            patch.object(settings_module, "load_stores", return_value=stores),
++            patch.object(
++                settings_module,
++                "get_data_path",
++                side_effect=lambda name: str(Path(directory) / name),
++            ),
++            patch.object(
++                settings_module,
++                "OVERRIDES_FILE",
++                str(Path(directory) / "manual_overrides.json"),
++            ),
++            patch.object(settings_module, "save_stores"),
++        )
++        for active_patch in patches:
++            active_patch.start()
++            self.addCleanup(active_patch.stop)
++        return settings_module, settings_module.SettingsWindow()
++
++    def test_button_count_and_enabled_state_follow_global_setting(self):
++        with tempfile.TemporaryDirectory() as directory:
++            _, window = self._open_settings(
++                directory,
++                {
++                    "personalization_append_store_to_delivery_folder": True,
++                    "personalization_store_suffix_exclusions": [
++                        "Store 00", "Deleted Store"
++                    ],
++                },
++            )
++            try:
++                self.assertTrue(window.store_suffix_exclusions_button.isEnabled())
++                self.assertEqual(
++                    window.store_suffix_exclusions_button.text(), "Кроме… (1)"
++                )
++                window.append_store_name_checkbox.setChecked(False)
++                self.app.processEvents()
++                self.assertFalse(window.store_suffix_exclusions_button.isEnabled())
++                self.assertIn("Deleted Store", window.store_suffix_exclusions)
++            finally:
++                window.close()
++                self.app.processEvents()
++
++    def test_cancel_does_not_write_exclusions(self):
++        with tempfile.TemporaryDirectory() as directory:
++            settings_module, window = self._open_settings(
++                directory,
++                {"personalization_append_store_to_delivery_folder": True},
++            )
++            fake_dialog = Mock()
++            fake_dialog.exec.return_value = QDialog.DialogCode.Rejected
++            try:
++                with patch.object(
++                    settings_module,
++                    "StoreSuffixExclusionsDialog",
++                    return_value=fake_dialog,
++                ), patch.object(settings_module, "atomic_write_json") as writer:
++                    window._edit_store_suffix_exclusions()
++                writer.assert_not_called()
++            finally:
++                window.close()
++                self.app.processEvents()
++
++    def test_accept_saves_once_and_prunes_deleted_stores(self):
++        with tempfile.TemporaryDirectory() as directory:
++            settings_module, window = self._open_settings(
++                directory,
++                {
++                    "personalization_append_store_to_delivery_folder": True,
++                    "personalization_store_suffix_exclusions": ["Deleted Store"],
++                },
++            )
++            fake_dialog = Mock()
++            fake_dialog.exec.return_value = QDialog.DialogCode.Accepted
++            fake_dialog.selected_store_names.return_value = {
++                "Store 01", "Deleted Store"
++            }
++            try:
++                with patch.object(
++                    settings_module,
++                    "StoreSuffixExclusionsDialog",
++                    return_value=fake_dialog,
++                ), patch.object(settings_module, "atomic_write_json") as writer:
++                    window._edit_store_suffix_exclusions()
++                writer.assert_called_once()
++                saved_config = writer.call_args.args[1]
++                self.assertEqual(
++                    saved_config["personalization_store_suffix_exclusions"],
++                    ["Store 01"],
++                )
++                self.assertEqual(window.store_suffix_exclusions, {"Store 01"})
++                self.assertEqual(
++                    window.store_suffix_exclusions_button.text(), "Кроме… (1)"
++                )
++            finally:
++                window.close()
++                self.app.processEvents()
++
++    def test_dialog_shows_alias_and_internal_name(self):
++        import gui.settings_window as settings_module
++
++        dialog = settings_module.StoreSuffixExclusionsDialog(
++            ["Internal"],
++            lambda _: "Visible alias",
++            {"Internal"},
++        )
++        try:
++            checkbox = dialog._checkboxes["Internal"]
++            self.assertEqual(checkbox.text(), "Visible alias (Internal)")
++            self.assertTrue(checkbox.isChecked())
++            self.assertEqual(dialog.selected_store_names(), {"Internal"})
++        finally:
++            dialog.close()
++            self.app.processEvents()
++
+ if __name__ == "__main__":
+     unittest.main()
+--- a/RexArticles.iss
++++ b/RexArticles.iss
+@@ -1,5 +1,5 @@
+-﻿#define MyAppName "RexArticles"
+-#define MyAppVersion "1.0.0"
++#define MyAppName "RexArticles"
++#define MyAppVersion "1.0.1"
+ #define MyAppPublisher "RexArticles"
+ #define MyAppExeName "RexArticles.exe"
+ 

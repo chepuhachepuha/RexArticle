@@ -16,6 +16,9 @@ from PySide6.QtGui import QDesktopServices
 
 from core.store_manager import load_stores, save_stores
 from core.paths import get_data_path
+from core.json_storage import atomic_write_json
+from core.personalization import normalise_store_suffix_exclusions
+from matcher import MATCHER_CLASSES
 from indexer import (
     remove_index_for_store,
     update_index_for_store,
@@ -29,6 +32,43 @@ from core.yandex_disk import (
 from gui.dialogs.yandex_disk_picker import YandexDiskPickerDialog
 
 OVERRIDES_FILE = get_data_path("manual_overrides.json")
+
+
+class StoreSuffixExclusionsDialog(QDialog):
+    def __init__(self, stores, display_name, selected_store_names=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Не подписывать магазины")
+        self.resize(520, 460)
+        self._checkboxes = {}
+        selected = normalise_store_suffix_exclusions(selected_store_names)
+        layout = QVBoxLayout(self)
+        hint = QLabel("Отметьте магазины, название которых не нужно добавлять к папке поставки.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        container = QWidget(scroll)
+        stores_layout = QVBoxLayout(container)
+        for store_name in stores:
+            visible = display_name(store_name)
+            label = visible if visible == store_name else f"{visible} ({store_name})"
+            checkbox = QCheckBox(label, container)
+            checkbox.setChecked(store_name in selected)
+            self._checkboxes[store_name] = checkbox
+            stores_layout.addWidget(checkbox)
+        stores_layout.addStretch()
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_store_names(self):
+        return {name for name, checkbox in self._checkboxes.items() if checkbox.isChecked()}
 
 
 class SettingsIndexSignals(QObject):
@@ -198,9 +238,13 @@ class SettingsWindow(QDialog):
         self.store_display_names = dict(
             self.app_config.get("store_display_names", {}) or {}
         )
+        self.store_suffix_exclusions = normalise_store_suffix_exclusions(
+            self.app_config.get("personalization_store_suffix_exclusions", [])
+        )
         self.selected_store = None
         self.needs_reset_cache = False
         self.type_vars = {}
+        self.store_buttons = {}
         self.index_worker = None
         self.index_dialog = None
         self.index_thread_pool = QThreadPool.globalInstance()
@@ -250,13 +294,13 @@ class SettingsWindow(QDialog):
         sidebar_hint.setObjectName("settingsSidebarHint")
         left_layout.addWidget(sidebar_hint)
         
-        scroll_area = QScrollArea()
-        scroll_area.setObjectName("storesScroll")
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QFrame.NoFrame)
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_area.viewport().setObjectName("storesViewport")
+        self.stores_scroll_area = QScrollArea()
+        self.stores_scroll_area.setObjectName("storesScroll")
+        self.stores_scroll_area.setWidgetResizable(True)
+        self.stores_scroll_area.setFrameShape(QFrame.NoFrame)
+        self.stores_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.stores_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.stores_scroll_area.viewport().setObjectName("storesViewport")
         
         self.stores_container = QWidget()
         self.stores_container.setObjectName("storesContainer")
@@ -265,8 +309,8 @@ class SettingsWindow(QDialog):
         self.stores_layout.setSpacing(4)
         self.stores_layout.setAlignment(Qt.AlignTop)
         
-        scroll_area.setWidget(self.stores_container)
-        left_layout.addWidget(scroll_area, stretch=1)
+        self.stores_scroll_area.setWidget(self.stores_container)
+        left_layout.addWidget(self.stores_scroll_area, stretch=1)
         
         separator = QFrame()
         separator.setFrameShape(QFrame.HLine)
@@ -327,6 +371,7 @@ class SettingsWindow(QDialog):
         right_layout.addWidget(self.store_subtitle)
         
         settings_scroll = QScrollArea()
+        self.settings_scroll = settings_scroll
         settings_scroll.setObjectName("settingsScroll")
         settings_scroll.setWidgetResizable(True)
         settings_scroll.setFrameShape(QFrame.NoFrame)
@@ -466,7 +511,15 @@ class SettingsWindow(QDialog):
                 "personalization_append_store_to_delivery_folder", False
             )
         ))
-        behavior_layout.addWidget(self.append_store_name_checkbox)
+        store_suffix_layout = QHBoxLayout()
+        store_suffix_layout.addWidget(self.append_store_name_checkbox, 1)
+        self.store_suffix_exclusions_button = QPushButton()
+        self.store_suffix_exclusions_button.clicked.connect(
+            self._edit_store_suffix_exclusions
+        )
+        store_suffix_layout.addWidget(self.store_suffix_exclusions_button)
+        behavior_layout.addLayout(store_suffix_layout)
+        self._update_store_suffix_exclusions_button()
 
         self.store_names_button = QPushButton("Названия магазинов")
         self.store_names_button.clicked.connect(self._edit_store_display_names)
@@ -485,13 +538,57 @@ class SettingsWindow(QDialog):
             self.append_store_name_checkbox,
         ):
             checkbox.toggled.connect(self._save_personalization_settings)
+        self.append_store_name_checkbox.toggled.connect(
+            self._update_store_suffix_exclusions_button
+        )
         return tab
 
     def _display_store_name(self, store_name):
         display_name = str(self.store_display_names.get(store_name, "")).strip()
         return display_name or store_name
+    def _update_store_suffix_exclusions_button(self, *_):
+        valid_exclusions = self.store_suffix_exclusions.intersection(self.stores)
+        count = len(valid_exclusions)
+        text = "Кроме…" if count == 0 else f"Кроме… ({count})"
+        self.store_suffix_exclusions_button.setText(text)
+        self.store_suffix_exclusions_button.setEnabled(
+            self.append_store_name_checkbox.isChecked()
+        )
 
+    def _edit_store_suffix_exclusions(self):
+        dialog = StoreSuffixExclusionsDialog(
+            self.stores,
+            self._display_store_name,
+            self.store_suffix_exclusions,
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected = dialog.selected_store_names()
+        config = self._load_app_config()
+        config["personalization_store_suffix_exclusions"] = [
+            store_name
+            for store_name in self.stores
+            if store_name in selected
+        ]
+        try:
+            atomic_write_json(self.config_file, config)
+        except OSError as error:
+            QMessageBox.critical(
+                self,
+                "Ошибка",
+                f"Не удалось сохранить исключения магазинов: {error}",
+            )
+            return
+
+        self.app_config = config
+        self.store_suffix_exclusions = set(
+            config["personalization_store_suffix_exclusions"]
+        )
+        self._update_store_suffix_exclusions_button()
     def _open_logs(self):
+
         from gui.dialogs.log_window import LogWindow
 
         LogWindow(self).exec()
@@ -581,6 +678,11 @@ class SettingsWindow(QDialog):
             "personalization_append_store_to_delivery_folder": (
                 self.append_store_name_checkbox.isChecked()
             ),
+            "personalization_store_suffix_exclusions": [
+                store_name
+                for store_name in self.stores
+                if store_name in self.store_suffix_exclusions
+            ],
         })
         try:
             with open(self.config_file, "w", encoding="utf-8") as file:
@@ -754,63 +856,38 @@ class SettingsWindow(QDialog):
             widget.setStyleSheet("")
     
     def refresh_store_buttons(self):
+        scroll_value = self.stores_scroll_area.verticalScrollBar().value()
+        current_names = set(self.stores)
+        for name in list(self.store_buttons):
+            if name not in current_names:
+                self.store_buttons.pop(name).deleteLater()
         while self.stores_layout.count():
-            item = self.stores_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                # deleteLater() срабатывает только в следующем event loop;
-                # без отсоединения старая кнопка успевает отрисоваться поверх новой.
-                widget.hide()
-                widget.setParent(None)
-                widget.deleteLater()
-        
-        base_style = """
-            QPushButton {
-                text-align: left;
-                padding: 6px 10px;
-                border: 1px solid #E0E0E0;
-                border-radius: 4px;
-                background-color: #FFFFFF;
-                font-size: 12px;
-                min-height: 16px;
-                color: #212121;
-            }
-            QPushButton:hover {
-                background-color: #F5F5F5;
-                border-color: #BDBDBD;
-            }
-        """
-        
-        selected_style = """
-            QPushButton {
-                text-align: left;
-                padding: 6px 10px;
-                border: 1px solid #9E9E9E;
-                border-radius: 4px;
-                background-color: #E0E0E0;
-                font-weight: 600;
-                font-size: 12px;
-                min-height: 16px;
-                color: #212121;
-            }
-            QPushButton:hover {
-                background-color: #D5D5D5;
-            }
-        """
-        
-        for store_name in self.stores.keys():
-            button = QPushButton(self._display_store_name(store_name))
-            button.setFixedHeight(30)
-            
-            button.setProperty("sidebarItem", True)
+            self.stores_layout.takeAt(0)
+        for store_name in self.stores:
+            button = self.store_buttons.get(store_name)
+            if button is None:
+                button = QPushButton()
+                button.setFixedHeight(30)
+                button.setProperty("sidebarItem", True)
+                button.clicked.connect(
+                    lambda checked=False, name=store_name: self.select_store(name)
+                )
+                self.store_buttons[store_name] = button
+            button.setText(self._display_store_name(store_name))
             button.setProperty("selected", store_name == self.selected_store)
-            
-            button.clicked.connect(lambda checked, n=store_name: self.select_store(n))
+            button.style().unpolish(button)
+            button.style().polish(button)
             self.stores_layout.addWidget(button)
-        
         self.stores_layout.addStretch(1)
+        QTimer.singleShot(
+            0,
+            lambda value=scroll_value: self.stores_scroll_area.verticalScrollBar().setValue(
+                min(value, self.stores_scroll_area.verticalScrollBar().maximum())
+            ),
+        )
     
     def select_store(self, store_name):
+        left_scroll = self.stores_scroll_area.verticalScrollBar().value()
         self.selected_store = store_name
         self.store_title.setText(
             f"Настройки: {self._display_store_name(store_name)}"
@@ -820,6 +897,9 @@ class SettingsWindow(QDialog):
         self.refresh_types_for_store(store_name)
         self.update_overrides_stats()
         self.refresh_store_buttons()
+        QTimer.singleShot(
+            0, lambda value=left_scroll: self.stores_scroll_area.verticalScrollBar().setValue(value)
+        )
         self._clear_inline_styles()
     
     def refresh_types_for_store(self, store_name):
@@ -866,6 +946,8 @@ class SettingsWindow(QDialog):
             "copy_on_override": False,
             "override_path": "",
             "source": "local",
+            "png_only": False,
+            "matcher": "Simple",
         }
         self.stores[store_name][supply_type] = values.copy()
         self.type_vars.setdefault(store_name, {})[supply_type] = values.copy()
@@ -881,6 +963,8 @@ class SettingsWindow(QDialog):
                 "copy_on_override": type_data.get("copy_on_override", False),
                 "override_path": type_data.get("override_path", ""),
                 "source": type_data.get("source", "local"),
+                "png_only": bool(type_data.get("png_only", False)),
+                "matcher": type_data.get("matcher", "Simple"),
             }
         
         vars_dict = self.type_vars[store_name][supply_type]
@@ -955,6 +1039,21 @@ class SettingsWindow(QDialog):
         )
         source_layout.addWidget(source_combo, 1)
         group_layout.addLayout(source_layout)
+
+        matcher_layout = QHBoxLayout()
+        matcher_label = QLabel("Алгоритм поиска:")
+        matcher_label.setFixedWidth(120)
+        matcher_layout.addWidget(matcher_label)
+        matcher_combo = QComboBox()
+        matcher_combo.addItems(MATCHER_CLASSES.keys())
+        matcher_combo.setCurrentText(
+            vars_dict["matcher"] if vars_dict["matcher"] in MATCHER_CLASSES else "Simple"
+        )
+        matcher_combo.currentTextChanged.connect(
+            lambda name, st=supply_type: self._on_matcher_changed(st, name)
+        )
+        matcher_layout.addWidget(matcher_combo, 1)
+        group_layout.addLayout(matcher_layout)
         
         # Папка
         folder_layout = QHBoxLayout()
@@ -1010,6 +1109,14 @@ class SettingsWindow(QDialog):
         separator.setFrameShadow(QFrame.Sunken)
         group_layout.addWidget(separator)
         
+        png_only_checkbox = QCheckBox("Искать только PNG")
+        png_only_checkbox.setObjectName("pngOnly")
+        png_only_checkbox.setChecked(bool(vars_dict.get("png_only", False)))
+        png_only_checkbox.toggled.connect(
+            lambda checked, st=supply_type: self._on_png_only_toggled(st, checked)
+        )
+        group_layout.addWidget(png_only_checkbox)
+
         # Настройки уточнения — ОДИН чекбокс
         override_title = QLabel("Настройки уточнения:")
         override_title.setStyleSheet("font-weight: 600; font-size: 12px;")
@@ -1132,6 +1239,12 @@ class SettingsWindow(QDialog):
                     "copy_on_override": vars_dict["copy_on_override"],
                     "override_path": vars_dict["override_path"].strip(),
                     "source": vars_dict.get("source", "local"),
+                    "png_only": bool(vars_dict.get("png_only", False)),
+                    "matcher": (
+                        vars_dict.get("matcher", "Simple")
+                        if vars_dict.get("matcher", "Simple") in MATCHER_CLASSES
+                        else "Simple"
+                    ),
                 }
         
         for supply_type in set(list(old_store_data.keys()) + list(new_store_data.keys())):
@@ -1541,3 +1654,17 @@ class SettingsWindow(QDialog):
             self.update_overrides_stats()
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось очистить: {e}")
+    def _on_png_only_toggled(self, supply_type, checked):
+        if self.selected_store in self.type_vars:
+            self.type_vars[self.selected_store][supply_type]["png_only"] = bool(checked)
+            self._auto_save()
+
+    def _on_matcher_changed(self, supply_type, matcher_name):
+        if matcher_name not in MATCHER_CLASSES:
+            matcher_name = "Simple"
+        if self.selected_store in self.type_vars:
+            self.type_vars[self.selected_store][supply_type]["matcher"] = matcher_name
+            self._auto_save()
+            parent = self.parent()
+            if parent and hasattr(parent, "matcher_cache"):
+                parent.matcher_cache.clear()

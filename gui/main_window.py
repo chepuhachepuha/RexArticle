@@ -1,6 +1,7 @@
 import os
 import json
 import shutil
+import ntpath
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QToolBar, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QToolButton, QFrame, QLabel, QFileDialog, QMessageBox, QSizePolicy,
@@ -11,7 +12,10 @@ from PySide6.QtCore import (
     QTimer,
 )
 from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtCore import QStandardPaths
 from core.paths import get_data_path
+from core.personalization import normalise_store_suffix_exclusions, should_append_store_suffix
+from core.cancellation import OperationCancelled
 from gui.widgets.supply_tree import SupplyTreeView, SupplyTreeModel, SupplyDeliveryItem
 from gui.widgets.override_delegate import OverrideButtonDelegate
 from gui.dialogs.parse_progress_dialog import ParseProgressDialog
@@ -27,7 +31,7 @@ from indexer import (
     update_yandex_indexes,
 )
 from matcher import get_matcher_for_store
-from manual_overrides import get_override, set_override
+from manual_overrides import get_override, set_override, set_overrides
 
 
 # ============================================
@@ -36,7 +40,7 @@ from manual_overrides import get_override, set_override
 
 
 def _delivery_output_folder_name(pdf_path, store_name, append_store_name):
-    folder_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    folder_name = os.path.splitext(ntpath.basename(str(pdf_path)))[0]
     if append_store_name and store_name:
         safe_store_name = "".join(
             "_" if character in "/\\:" else character
@@ -53,6 +57,60 @@ def _result_file_base_name(file_path, article, manual_override_path):
     if manual_override_path and file_path == manual_override_path:
         return article
     return original_name
+
+
+def _override_dialog_directory(store_path, delivery_folder):
+    candidates = [
+        store_path,
+        delivery_folder,
+        QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation),
+        os.path.expanduser("~"),
+    ]
+    for candidate in candidates:
+        raw_value = str(candidate or "").strip()
+        raw_value = __import__("re").sub(
+            r"%([^%]+)%", lambda match: os.environ.get(match.group(1), match.group(0)), raw_value
+        )
+        value = os.path.normpath(os.path.expandvars(os.path.expanduser(raw_value)))
+        if value and os.path.isdir(value):
+            return value
+    return os.path.normpath(os.path.expanduser("~"))
+
+
+def _matching_article_indices(delivery_item, article):
+    target = str(article or "").strip()
+    return [
+        index for index in range(delivery_item.child_count())
+        if str(delivery_item.child(index).article or "").strip() == target
+    ]
+
+
+def _sync_not_found_file(output_folder, not_found_items, cancel_token=None):
+    os.makedirs(output_folder, exist_ok=True)
+    destination = os.path.join(output_folder, "ненайденные.txt")
+    temporary = destination + ".part"
+    if not not_found_items:
+        if os.path.exists(destination):
+            os.remove(destination)
+        if os.path.exists(temporary):
+            os.remove(temporary)
+        return
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            for position, article, size, location in not_found_items:
+                if cancel_token:
+                    cancel_token.raise_if_cancelled()
+                suffix = f"[{size} {location}]" if size and location else (
+                    f"[{size}]" if size else ""
+                )
+                stream.write(f"{position}.{article}{suffix}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    except Exception:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+        raise
 
 class CancellationFlag:
     """Общий флаг отмены для worker'ов."""
@@ -227,6 +285,8 @@ class SearchWorker(QRunnable):
         output_folder,
         matcher_cache,
         append_store_name=False,
+        store_suffix_exclusions=None,
+        cancel_flag=None,
     ):
         super().__init__()
         self.setAutoDelete(True)
@@ -234,6 +294,8 @@ class SearchWorker(QRunnable):
         self.output_folder = output_folder
         self.matcher_cache = matcher_cache
         self.append_store_name = append_store_name
+        self.store_suffix_exclusions = normalise_store_suffix_exclusions(store_suffix_exclusions)
+        self.cancel_flag = cancel_flag
         self.signals = SearchSignals()
     
     @Slot()
@@ -250,9 +312,12 @@ class SearchWorker(QRunnable):
         supply_type = delivery_item.supply_type
         index_store_name = f"{store_name}_{supply_type}"
         
-        if index_store_name not in self.matcher_cache:
-            self.matcher_cache[index_store_name] = get_matcher_for_store(index_store_name)
-        matcher = self.matcher_cache[index_store_name]
+        type_data = get_type_data(store_name, supply_type)
+        matcher_name = type_data.get("matcher", "Simple")
+        cache_key = (index_store_name, matcher_name)
+        if cache_key not in self.matcher_cache:
+            self.matcher_cache[cache_key] = get_matcher_for_store(index_store_name)
+        matcher = self.matcher_cache[cache_key]
         
         base_output_folder = os.path.join(self.output_folder, "Найденные_принты_все")
         os.makedirs(base_output_folder, exist_ok=True)
@@ -260,7 +325,11 @@ class SearchWorker(QRunnable):
         folder_name = _delivery_output_folder_name(
             delivery_item.pdf_path,
             getattr(delivery_item, "display_store_name", store_name),
-            self.append_store_name,
+            should_append_store_suffix(
+                store_name,
+                self.append_store_name,
+                self.store_suffix_exclusions,
+            ),
         )
         output_folder = os.path.join(base_output_folder, folder_name)
         os.makedirs(output_folder, exist_ok=True)
@@ -268,12 +337,17 @@ class SearchWorker(QRunnable):
         not_found_items = []
         
         for i in range(delivery_item.child_count()):
+            if self.cancel_flag and self.cancel_flag.is_canceled():
+                raise RuntimeError("Операция отменена")
             article_item = delivery_item.child(i)
             article = article_item.article
             size = article_item.size
             location = article_item.location
             
-            matches = matcher.find_file_by_article_and_size(article, size, index_store_name)
+            allowed_extensions = {".png"} if type_data.get("png_only", False) else None
+            matches = matcher.find_file_by_article_and_size(
+                article, size, index_store_name, allowed_extensions=allowed_extensions
+            )
             
             if matches:
                 file = matches[0]
@@ -306,19 +380,7 @@ class SearchWorker(QRunnable):
                 not_found_items.append((i + 1, article, size, location))
                 self.signals.article_status.emit(delivery_item, i, "Не найден")
         
-        if not_found_items:
-            not_found_path = os.path.join(output_folder, "ненайденные.txt")
-            try:
-                with open(not_found_path, "w", encoding="utf-8") as f:
-                    for position, art, size, location in not_found_items:
-                        if size and location:
-                            f.write(f"{position}.{art}[{size} {location}]\n")
-                        elif size:
-                            f.write(f"{position}.{art}[{size}]\n")
-                        else:
-                            f.write(f"{position}.{art}\n")
-            except Exception as e:
-                print(f"[ПОИСК] Ошибка создания файла ненайденных: {e}")
+        _sync_not_found_file(output_folder, not_found_items, self.cancel_flag)
         
         self.signals.delivery_finished.emit(delivery_item)
 
@@ -435,6 +497,9 @@ class MainWindow(QMainWindow):
         self.append_store_to_delivery_folder = bool(config.get(
             "personalization_append_store_to_delivery_folder", False
         ))
+        self.store_suffix_exclusions = normalise_store_suffix_exclusions(
+            config.get("personalization_store_suffix_exclusions", [])
+        )
         self.store_display_names = dict(
             config.get("store_display_names", {}) or {}
         )
@@ -458,6 +523,10 @@ class MainWindow(QMainWindow):
             "personalization_open_results_folder": self.open_results_folder,
             "personalization_append_store_to_delivery_folder": (
                 self.append_store_to_delivery_folder
+            ),
+            "personalization_store_suffix_exclusions": sorted(
+                self.store_suffix_exclusions,
+                key=str.casefold,
             ),
             "store_display_names": self.store_display_names,
         })
@@ -788,6 +857,18 @@ class MainWindow(QMainWindow):
     # Override
     # ============================================
     
+    def _remember_override_for_article(self, delivery_item, article, file_path, status):
+        indices = _matching_article_indices(delivery_item, article)
+        set_overrides(
+            delivery_item.store_name,
+            delivery_item.supply_type,
+            [(delivery_item.child(i).article, delivery_item.child(i).size) for i in indices],
+            file_path,
+        )
+        for index in indices:
+            self.tree_model.update_article_status(delivery_item, index, status)
+        return len(indices)
+
     def on_override_clicked(self, delivery_item, article_index):
         """
         Обработка клика по кнопке 'Уточнить' для артикула.
@@ -811,21 +892,23 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText(article)
         type_data = get_type_data(store_name, supply_type)
         if type_data.get("source") == "yandex":
-            picker = YandexDiskPickerDialog(select_file=True, parent=self)
+            picker = YandexDiskPickerDialog(
+                select_file=True, initial_path=type_data.get("path", ""), parent=self
+            )
             if picker.exec() != QDialog.Accepted:
                 return
-            set_override(store_name, supply_type, article, size, picker.selected_path)
-            self.tree_model.update_article_status(
-                delivery_item, article_index, "Уточнён (Яндекс Диск)"
+            linked_count = self._remember_override_for_article(
+                delivery_item, article, picker.selected_path, "Уточнён (Яндекс Диск)"
             )
             QMessageBox.information(
-                self, "Успех", "Облачный файл привязан к артикулу."
+                self, "Успех", f"Облачный файл привязан к {linked_count} поз."
             )
             return
 
         file_path, _ = QFileDialog.getOpenFileName(
-            self, f"Укажите путь артикула {article}", "",
-            "Изображения (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp);;Все файлы (*.*)"
+            self, f"Укажите путь артикула {article}",
+            _override_dialog_directory(type_data.get("path", ""), delivery_item.folder),
+            "Изображения (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp);;Все файлы (*.*)"
         )
         if not file_path:
             return
@@ -836,9 +919,12 @@ class MainWindow(QMainWindow):
         
         if not copy_on_override:
             # === Режим "Только запомнить путь" ===
-            set_override(store_name, supply_type, article, size, file_path)
-            QMessageBox.information(self, "Успех", f"Путь сохранён:\n{file_path}")
-            self.tree_model.update_article_status(delivery_item, article_index, "Уточнён (override)")
+            linked_count = self._remember_override_for_article(
+                delivery_item, article, file_path, "Уточнён (override)"
+            )
+            QMessageBox.information(
+                self, "Успех", f"Путь сохранён для {linked_count} поз.:\n{file_path}"
+            )
             return
         
         # === Режим "Копировать и переименовывать" ===
@@ -982,11 +1068,16 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         
-        if delivery_item.output_folder and os.path.exists(delivery_item.output_folder):
-            try:
-                shutil.rmtree(delivery_item.output_folder)
-            except Exception as e:
-                print(f"[RESTART] Ошибка удаления папки: {e}")
+        try:
+            for i in range(delivery_item.child_count()):
+                copied_file = delivery_item.child(i).copied_file
+                if copied_file and os.path.isfile(copied_file):
+                    os.remove(copied_file)
+            if delivery_item.output_folder:
+                _sync_not_found_file(delivery_item.output_folder, [])
+        except OSError as error:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось очистить результаты:\n{error}")
+            return
         
         for i in range(delivery_item.child_count()):
             self.tree_model.update_article_status(delivery_item, i, "Ожидание")
@@ -1054,6 +1145,8 @@ class MainWindow(QMainWindow):
             self.output_folder,
             self.matcher_cache,
             self.append_store_to_delivery_folder,
+            self.store_suffix_exclusions,
+            self.cancel_flag,
         )
         worker.signals.article_status.connect(self._on_article_status)
         worker.signals.article_copied.connect(self._on_article_copied)
@@ -1154,6 +1247,8 @@ class MainWindow(QMainWindow):
             self.output_folder,
             self.matcher_cache,
             self.append_store_to_delivery_folder,
+            self.store_suffix_exclusions,
+            self.cancel_flag,
         )
         worker.signals.article_status.connect(self._on_article_status)
         worker.signals.article_copied.connect(self._on_article_copied)
@@ -1177,7 +1272,11 @@ class MainWindow(QMainWindow):
                 "display_store_name",
                 delivery_item.store_name,
             ),
-            self.append_store_to_delivery_folder,
+            should_append_store_suffix(
+                delivery_item.store_name,
+                self.append_store_to_delivery_folder,
+                self.store_suffix_exclusions,
+            ),
         )
         output_folder = os.path.join(base_output_folder, folder_name)
         

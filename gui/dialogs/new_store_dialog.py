@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from supply_detector import detect_supply_type
+from matcher import MATCHER_CLASSES
 from core.store_manager import load_stores, save_stores
 from core.pdf_cache import get_pdf_text
 from gui.dialogs.yandex_disk_picker import YandexDiskPickerDialog
@@ -191,9 +192,19 @@ class NewStoreDialog(QDialog):
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
         form_layout.addWidget(self.type_combo, 1, 1)
 
+        matcher_label = QLabel("Алгоритм поиска:")
+        matcher_label.setStyleSheet("font-weight: 500;")
+        form_layout.addWidget(matcher_label, 2, 0)
+        self.matcher_combo = QComboBox()
+        self.matcher_combo.addItems(MATCHER_CLASSES.keys())
+        self.matcher_combo.setCurrentText("Simple")
+        self.matcher_combo.setStyleSheet(COMBOBOX_STYLE)
+        self.matcher_combo.setFrame(False)
+        form_layout.addWidget(self.matcher_combo, 2, 1, 1, 2)
+
         source_label = QLabel("Источник файлов:")
         source_label.setStyleSheet("font-weight: 500;")
-        form_layout.addWidget(source_label, 2, 0)
+        form_layout.addWidget(source_label, 3, 0)
 
         self.source_combo = QComboBox()
         self.source_combo.addItem("Локально", "local")
@@ -201,12 +212,12 @@ class NewStoreDialog(QDialog):
         self.source_combo.setStyleSheet(COMBOBOX_STYLE)
         self.source_combo.setFrame(False)
         self.source_combo.currentIndexChanged.connect(self.on_source_changed)
-        form_layout.addWidget(self.source_combo, 2, 1, 1, 2)
+        form_layout.addWidget(self.source_combo, 3, 1, 1, 2)
         
         # Папка
         self.folder_label = QLabel("Папка с принтами:")
         self.folder_label.setStyleSheet("font-weight: 500;")
-        form_layout.addWidget(self.folder_label, 3, 0)
+        form_layout.addWidget(self.folder_label, 4, 0)
         
         self.folder_input = QLineEdit()
         self.folder_input.setReadOnly(True)
@@ -220,7 +231,7 @@ class NewStoreDialog(QDialog):
                 color: #424242;
             }
         """)
-        form_layout.addWidget(self.folder_input, 3, 1)
+        form_layout.addWidget(self.folder_input, 4, 1)
         
         self.browse_button = QPushButton("...")
         self.browse_button.setFixedWidth(40)
@@ -242,7 +253,7 @@ class NewStoreDialog(QDialog):
             }
         """)
         self.browse_button.clicked.connect(self.choose_folder)
-        form_layout.addWidget(self.browse_button, 3, 2)
+        form_layout.addWidget(self.browse_button, 4, 2)
         
         layout.addLayout(form_layout)
         
@@ -378,7 +389,12 @@ class NewStoreDialog(QDialog):
             stores[store_name] = {}
         stores[store_name][supply_type] = {
             "path": folder,
-            "matcher": "Simple",
+            "matcher": (
+                self.matcher_combo.currentText()
+                if self.matcher_combo.currentText() in MATCHER_CLASSES
+                else "Simple"
+            ),
+            "png_only": False,
             "copy_on_override": False,
             "override_path": "",
             "source": source,

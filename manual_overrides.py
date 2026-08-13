@@ -1,5 +1,6 @@
 import json
 import os
+from core.json_storage import atomic_write_json
 
 from core.paths import get_data_path
 
@@ -26,8 +27,7 @@ def _load_to_cache():
     return _cache
 
 def _save_from_cache():
-    with open(OVERRIDES_FILE, "w", encoding="utf-8") as f:
-        json.dump(_cache, f, ensure_ascii=False, indent=2)
+    atomic_write_json(OVERRIDES_FILE, _cache)
 
 def invalidate_cache():
     global _cache
@@ -53,14 +53,17 @@ def get_override(store_name, supply_type, article, size):
     sub_key = _build_sub_key(article, size)
     return overrides.get(key, {}).get(sub_key)
 
-def set_override(store_name, supply_type, article, size, file_path):
+def set_overrides(store_name, supply_type, article_sizes, file_path):
     overrides = _load_to_cache()
     key = _build_key(store_name, supply_type)
-    sub_key = _build_sub_key(article, size)
-    if key not in overrides:
-        overrides[key] = {}
-    overrides[key][sub_key] = file_path
+    store_overrides = overrides.setdefault(key, {})
+    for article, size in article_sizes:
+        store_overrides[_build_sub_key(article, size)] = file_path
     save_overrides(overrides)
+
+
+def set_override(store_name, supply_type, article, size, file_path):
+    set_overrides(store_name, supply_type, [(article, size)], file_path)
 
 def remove_override(store_name, supply_type, article, size):
     overrides = _load_to_cache()

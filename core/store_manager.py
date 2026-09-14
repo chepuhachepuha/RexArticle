@@ -2,6 +2,7 @@ import json
 import os
 
 from core.paths import get_data_path
+from core.json_storage import atomic_write_json
 STORES_FILE = get_data_path("stores.json")
 
 _stores_cache = None
@@ -10,11 +11,11 @@ def load_stores():
     global _stores_cache
     if _stores_cache is not None:
         return _stores_cache.copy()
-    
+
     if not os.path.exists(STORES_FILE):
         _stores_cache = {}
         return {}
-    
+
     try:
         with open(STORES_FILE, "r", encoding="utf-8") as f:
             content = f.read().strip()
@@ -25,21 +26,14 @@ def load_stores():
     except (json.JSONDecodeError, FileNotFoundError):
         _stores_cache = {}
         return {}
-    
+
     needs_migration = False
     for store_name, value in stores.items():
         if isinstance(value, str):
             needs_migration = True
         elif isinstance(value, dict) and "path" in value:
             needs_migration = True
-        elif isinstance(value, dict):
-            for type_data in value.values():
-                if isinstance(type_data, dict) and (
-                    "matcher" not in type_data or "png_only" not in type_data
-                ):
-                    needs_migration = True
-                    break
-    
+
     if needs_migration:
         new_stores = {}
         for store_name, value in stores.items():
@@ -85,14 +79,13 @@ def load_stores():
         stores = new_stores
         save_stores(stores)
         print(f"DEBUG: Миграция stores.json завершена: {len(stores)} магазинов")
-    
+
     _stores_cache = stores
     return stores.copy()
 
 def save_stores(stores):
     global _stores_cache
-    with open(STORES_FILE, "w", encoding="utf-8") as f:
-        json.dump(stores, f, ensure_ascii=False, indent=2)
+    atomic_write_json(STORES_FILE, stores)
     _stores_cache = stores.copy()
 
 def get_store(store_name):

@@ -1,20 +1,25 @@
+"""Cooperative cancellation primitives shared by background operations."""
+from __future__ import annotations
+
+import threading
+
+
 class OperationCancelled(RuntimeError):
-    pass
+    """Raised when a background operation is cancelled cooperatively."""
 
 
 class CancellationToken:
-    def __init__(self):
-        self._cancelled = False
+    """Small thread-safe cancellation token suitable for QRunnable workers."""
 
-    def cancel(self):
-        self._cancelled = True
+    def __init__(self) -> None:
+        self._event = threading.Event()
 
-    def is_cancelled(self):
-        return self._cancelled
+    def cancel(self) -> None:
+        self._event.set()
 
-    def is_canceled(self):
-        return self._cancelled
+    def is_cancelled(self) -> bool:
+        return self._event.is_set()
 
-    def raise_if_cancelled(self):
-        if self._cancelled:
+    def raise_if_cancelled(self) -> None:
+        if self.is_cancelled():
             raise OperationCancelled("Операция отменена")

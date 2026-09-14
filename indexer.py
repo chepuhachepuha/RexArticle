@@ -91,7 +91,8 @@ def _connect() -> sqlite3.Connection:
 
 
 def _normalise_path(path: str) -> str:
-    return os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+    """Return an absolute path without changing the original filename case."""
+    return os.path.normpath(os.path.abspath(os.path.expanduser(path)))
 
 
 def _roots(folder_path: str, override_path: str = None) -> list[dict]:
@@ -124,7 +125,7 @@ def _is_network_path(path: str) -> bool:
     return False
 
 
-def _scan_files(roots: list[dict], progress_callback=None) -> dict:
+def _scan_files(roots: list[dict], progress_callback=None, cancel_token=None) -> dict:
     """Собирает метаданные без чтения содержимого файлов."""
     files = {}
     folders_scanned = 0
@@ -161,10 +162,14 @@ def _scan_files(roots: list[dict], progress_callback=None) -> dict:
         return []
 
     def scan_directory(folder_path: str, priority: int, is_network: bool):
+        if cancel_token:
+            cancel_token.raise_if_cancelled()
         folder_number = report_folder(folder_path)
         files_before = len(files)
         entries = read_entries(folder_path, is_network)
         for entry in entries:
+            if cancel_token:
+                cancel_token.raise_if_cancelled()
             try:
                 article, extension = os.path.splitext(entry.name)
 
@@ -217,6 +222,8 @@ def _scan_files(roots: list[dict], progress_callback=None) -> dict:
             progress_callback(folder_path, folder_number, len(files))
 
     for root_info in roots:
+        if cancel_token:
+            cancel_token.raise_if_cancelled()
         folder_path = root_info["path"]
         if not os.path.isdir(folder_path):
             continue
@@ -365,6 +372,7 @@ def update_index_for_store(
     override_path: str = None,
     force: bool = False,
     progress_callback=None,
+    cancel_token=None,
 ) -> bool:
     """Инкрементально синхронизирует файловый индекс магазина с SQLite."""
     started = time.perf_counter()
@@ -407,7 +415,7 @@ def update_index_for_store(
             return False
 
         try:
-            current_files = _scan_files(roots, progress_callback=progress_callback)
+            current_files = _scan_files(roots, progress_callback=progress_callback, cancel_token=cancel_token)
         except NetworkScanError as error:
             if not schema_is_valid:
                 raise
@@ -418,6 +426,8 @@ def update_index_for_store(
                 f"SQLite-индекс ({len(index)} артикулов). Причина: {error}"
             )
             return False
+        if cancel_token:
+            cancel_token.raise_if_cancelled()
         scanned_at_ns = time.time_ns()
         full_rebuild = not schema_is_valid
 
@@ -510,6 +520,7 @@ def update_yandex_index_for_store(
     client: YandexDiskClient | None = None,
     force: bool = False,
     progress_callback=None,
+    cancel_token=None,
 ) -> bool:
     """Инкрементально синхронизирует SQLite через REST API Яндекс Диска."""
     started = time.perf_counter()
@@ -562,6 +573,8 @@ def update_yandex_index_for_store(
     for resource in client.iter_files(
         cloud_path, progress_callback=api_progress
     ):
+        if cancel_token:
+            cancel_token.raise_if_cancelled()
         resource_uri = resource.uri
         if not full_rebuild and resource_uri in previous_files:
             # Известный путь сразу отбрасывается: полный удалённый/изменённый
@@ -589,6 +602,8 @@ def update_yandex_index_for_store(
             added_paths = set(current_files)
             changed_paths = set()
 
+        if cancel_token:
+            cancel_token.raise_if_cancelled()
         scanned_at_ns = time.time_ns()
         with connection:
             if full_rebuild:
@@ -686,6 +701,7 @@ def update_yandex_indexes(
     max_workers: int = 4,
     on_store_started=None,
     on_store_finished=None,
+    cancel_token=None,
 ) -> dict:
     """Append-only обновляет облачные магазины четырьмя независимыми потоками."""
     started = time.perf_counter()
@@ -708,6 +724,8 @@ def update_yandex_indexes(
         client = YandexDiskClient()
         group_results = {}
         for position, task in group:
+            if cancel_token:
+                cancel_token.raise_if_cancelled()
             if on_store_started:
                 on_store_started(position, total, task)
             group_results[task["key"]] = update_yandex_index_for_store(
@@ -716,6 +734,7 @@ def update_yandex_indexes(
                 client=client,
                 force=True,
                 progress_callback=task.get("progress_callback"),
+                cancel_token=cancel_token,
             )
             if on_store_finished:
                 on_store_finished(position, total, task)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import ssl
+import sys
 import threading
 import time
 from collections import deque
@@ -22,6 +23,7 @@ DEFAULT_CLIENT_ID = "77312c3ec72a418ebb59fd460c6940f9"
 DEFAULT_REDIRECT_URI = "https://oauth.yandex.ru/verification_code"
 TOKEN_ENVIRONMENT_VARIABLE = "REXARTICLES_YANDEX_TOKEN"
 TOKEN_CONFIG_KEY = "yandex_oauth_token"
+YANDEX_DISK_AVAILABLE = not sys.platform.startswith("win")
 CONFIG_FILE = get_data_path("config.json")
 _session_token = None
 _saved_token_checked = False

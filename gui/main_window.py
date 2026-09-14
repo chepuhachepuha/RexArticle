@@ -1,21 +1,26 @@
 import os
+import ntpath
 import json
 import shutil
-import ntpath
+import sys
+import re
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QToolBar, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QToolButton, QFrame, QLabel, QFileDialog, QMessageBox, QSizePolicy,
-    QDialog,
+    QDialog, QProgressDialog,
 )
 from PySide6.QtCore import (
     Qt, QDateTime, QTime, QUrl, QRunnable, QThreadPool, Signal, QObject, Slot,
-    QTimer,
+    QTimer, QStandardPaths,
 )
 from PySide6.QtGui import QAction, QDesktopServices
-from PySide6.QtCore import QStandardPaths
 from core.paths import get_data_path
-from core.personalization import normalise_store_suffix_exclusions, should_append_store_suffix
-from core.cancellation import OperationCancelled
+from core.json_storage import atomic_write_json
+from core.cancellation import CancellationToken, OperationCancelled
+from core.personalization import (
+    normalise_store_suffix_exclusions,
+    should_append_store_suffix,
+)
 from gui.widgets.supply_tree import SupplyTreeView, SupplyTreeModel, SupplyDeliveryItem
 from gui.widgets.override_delegate import OverrideButtonDelegate
 from gui.dialogs.parse_progress_dialog import ParseProgressDialog
@@ -39,89 +44,156 @@ from manual_overrides import get_override, set_override, set_overrides
 # ============================================
 
 
-def _delivery_output_folder_name(pdf_path, store_name, append_store_name):
-    folder_name = os.path.splitext(ntpath.basename(str(pdf_path)))[0]
-    if append_store_name and store_name:
-        safe_store_name = "".join(
-            "_" if character in "/\\:" else character
-            for character in str(store_name)
-        ).strip()
-        if safe_store_name:
-            folder_name += f" [{safe_store_name}]"
-    return folder_name
+def _system_desktop_path():
+    """Return the physical Windows desktop, including OneDrive redirection."""
+    desktop = QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.DesktopLocation
+    )
+    if not desktop:
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    return os.path.normpath(os.path.expandvars(os.path.expanduser(desktop)))
 
 
-def _result_file_base_name(file_path, article, manual_override_path):
-    """Для ручного override называет итоговую копию артикулом поставки."""
-    original_name = os.path.splitext(os.path.basename(file_path))[0]
-    if manual_override_path and file_path == manual_override_path:
-        return article
-    return original_name
-
+def _normalise_output_folder(path):
+    """Replace stale cross-platform paths with the current system desktop."""
+    value = os.path.normpath(
+        os.path.expandvars(os.path.expanduser(str(path or "").strip()))
+    )
+    if value and os.path.isdir(value):
+        return value
+    return _system_desktop_path()
 
 def _override_dialog_directory(store_path, delivery_folder):
+    """Return the first existing physical folder suitable for file selection."""
     candidates = [
         store_path,
         delivery_folder,
-        QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation),
+        QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DocumentsLocation
+        ),
         os.path.expanduser("~"),
     ]
     for candidate in candidates:
         raw_value = str(candidate or "").strip()
-        raw_value = __import__("re").sub(
-            r"%([^%]+)%", lambda match: os.environ.get(match.group(1), match.group(0)), raw_value
+        raw_value = re.sub(
+            r"%([^%]+)%",
+            lambda match: os.environ.get(match.group(1), match.group(0)),
+            raw_value,
         )
-        value = os.path.normpath(os.path.expandvars(os.path.expanduser(raw_value)))
+        value = os.path.normpath(
+            os.path.expandvars(os.path.expanduser(raw_value))
+        )
         if value and os.path.isdir(value):
             return value
     return os.path.normpath(os.path.expanduser("~"))
 
 
 def _matching_article_indices(delivery_item, article):
+    """Return every row in this delivery with the same trimmed article."""
     target = str(article or "").strip()
     return [
-        index for index in range(delivery_item.child_count())
+        index
+        for index in range(delivery_item.child_count())
         if str(delivery_item.child(index).article or "").strip() == target
     ]
 
+def _output_directory_dialog_options():
+    """Use filesystem-only folder selection on Windows.
+
+    The native Windows dialog can return a virtual Desktop shell object
+    instead of its physical path. Qt's dialog always returns a path.
+    """
+    options = QFileDialog.Option.ShowDirsOnly
+    if sys.platform.startswith("win"):
+        options |= QFileDialog.Option.DontUseNativeDialog
+    return options
 
 def _sync_not_found_file(output_folder, not_found_items, cancel_token=None):
-    os.makedirs(output_folder, exist_ok=True)
-    destination = os.path.join(output_folder, "ненайденные.txt")
-    temporary = destination + ".part"
+    """Atomically make ненайденные.txt reflect one completed search."""
+    not_found_path = os.path.join(output_folder, "ненайденные.txt")
+    temporary_path = not_found_path + ".part"
+
+    if cancel_token:
+        cancel_token.raise_if_cancelled()
+
     if not not_found_items:
-        if os.path.exists(destination):
-            os.remove(destination)
-        if os.path.exists(temporary):
-            os.remove(temporary)
+        try:
+            os.remove(not_found_path)
+        except FileNotFoundError:
+            pass
         return
+
     try:
-        with open(temporary, "w", encoding="utf-8") as stream:
+        with open(temporary_path, "w", encoding="utf-8", newline="") as file:
             for position, article, size, location in not_found_items:
                 if cancel_token:
                     cancel_token.raise_if_cancelled()
-                suffix = f"[{size} {location}]" if size and location else (
-                    f"[{size}]" if size else ""
-                )
-                stream.write(f"{position}.{article}{suffix}\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, destination)
+                if size and location:
+                    file.write(f"{position}.{article}[{size} {location}]\n")
+                elif size:
+                    file.write(f"{position}.{article}[{size}]\n")
+                else:
+                    file.write(f"{position}.{article}\n")
+            file.flush()
+            os.fsync(file.fileno())
+        if cancel_token:
+            cancel_token.raise_if_cancelled()
+        os.replace(temporary_path, not_found_path)
     except Exception:
-        if os.path.exists(temporary):
-            os.remove(temporary)
+        try:
+            os.remove(temporary_path)
+        except FileNotFoundError:
+            pass
         raise
 
-class CancellationFlag:
-    """Общий флаг отмены для worker'ов."""
-    def __init__(self):
-        self.canceled = False
-    
-    def cancel(self):
-        self.canceled = True
-    
+_WINDOWS_INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
+
+
+def _safe_filename_component(value, fallback="result", max_length=180):
+    """Return one Windows-safe path component; never create nested paths."""
+    name = _WINDOWS_INVALID_NAME.sub("_", str(value or ""))
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    if not name:
+        name = fallback
+    if name.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
+        name = f"_{name}"
+    name = name[:max_length].rstrip(" .")
+    return name or fallback
+
+
+def _delivery_output_folder_name(pdf_path, store_name, append_store_name):
+    folder_name = _safe_filename_component(
+        os.path.splitext(ntpath.basename(str(pdf_path)))[0], "Поставка", 120
+    )
+    if append_store_name and store_name:
+        safe_store_name = _safe_filename_component(store_name, "", 80)
+        if safe_store_name:
+            folder_name = _safe_filename_component(
+                f"{folder_name} [{safe_store_name}]", "Поставка", 200
+            )
+    return folder_name
+
+
+def _result_file_base_name(file_path, article, manual_override_path):
+    """Return a safe flat filename for automatic and manual matches."""
+    original_name = os.path.splitext(ntpath.basename(str(file_path)))[0]
+    source_name = (
+        article
+        if manual_override_path and file_path == manual_override_path
+        else original_name
+    )
+    return _safe_filename_component(source_name, "print", 180)
+
+class CancellationFlag(CancellationToken):
+    """Backward-compatible parse cancellation flag."""
+
     def is_canceled(self):
-        return self.canceled
+        return self.is_cancelled()
 
 
 # ============================================
@@ -136,7 +208,7 @@ class ParseSignals(QObject):
 
 class ParseWorker(QRunnable):
     """Worker для парсинга PDF в фоне."""
-    
+
     def __init__(self, pdf_path, delivery_item, supply_type, cancel_flag):
         super().__init__()
         self.setAutoDelete(True)
@@ -145,16 +217,16 @@ class ParseWorker(QRunnable):
         self.supply_type = supply_type
         self.cancel_flag = cancel_flag
         self.signals = ParseSignals()
-    
+
     @Slot()
     def run(self):
         # Проверяем отмену перед стартом
         if self.cancel_flag.is_canceled():
             return
-        
+
         try:
             self.signals.started.emit(self.delivery_item, self.pdf_path)
-            
+
             if self.supply_type == "WB":
                 parsed = parse_wb_supply(self.pdf_path)
                 articles = parsed["articles"]
@@ -166,11 +238,11 @@ class ParseWorker(QRunnable):
                 store_name = "UNKNOWN"
             else:
                 raise ValueError(f"Неизвестный тип поставки: {self.supply_type}")
-            
+
             # Проверяем отмену после парсинга
             if self.cancel_flag.is_canceled():
                 return
-            
+
             self.signals.finished.emit(
                 self.delivery_item, articles, sizes, locations, store_name
             )
@@ -186,17 +258,20 @@ class IndexRebuildSignals(QObject):
 
 
 class IndexRebuildWorker(QRunnable):
-    def __init__(self, stores_to_rebuild):
+    def __init__(self, stores_to_rebuild, cancel_token=None):
         super().__init__()
         self.setAutoDelete(True)
         self.stores_to_rebuild = stores_to_rebuild
+        self.cancel_token = cancel_token
         self.signals = IndexRebuildSignals()
-    
+
     @Slot()
     def run(self):
         try:
             total = len(self.stores_to_rebuild)
             for i, (key, info) in enumerate(self.stores_to_rebuild.items(), start=1):
+                if self.cancel_token:
+                    self.cancel_token.raise_if_cancelled()
                 self.signals.progress.emit(i, total, f"{info['store_name']} ({info['supply_type']})")
                 if info.get("source") == "yandex":
                     print(
@@ -207,9 +282,12 @@ class IndexRebuildWorker(QRunnable):
                 update_index_for_store(
                     key, info["folder"],
                     override_path=info.get("override_path"),
-                    force=info.get("force", False)
+                    force=info.get("force", False),
+                    cancel_token=self.cancel_token,
                 )
             self.signals.finished.emit()
+        except OperationCancelled:
+            return
         except Exception as e:
             self.signals.error.emit(str(e))
 
@@ -221,10 +299,11 @@ class CloudAutoIndexSignals(QObject):
 class CloudAutoIndexWorker(QRunnable):
     """По расписанию append-only обновляет подготовленные облачные индексы."""
 
-    def __init__(self):
+    def __init__(self, cancel_token=None):
         super().__init__()
         self.setAutoDelete(True)
         self.signals = CloudAutoIndexSignals()
+        self.cancel_token = cancel_token
 
     @Slot()
     def run(self):
@@ -249,7 +328,7 @@ class CloudAutoIndexWorker(QRunnable):
                     continue
                 tasks.append({"key": key, "folder": cloud_path})
         try:
-            results = update_yandex_indexes(tasks)
+            results = update_yandex_indexes(tasks, cancel_token=self.cancel_token)
             changed_count = sum(bool(changed) for changed in results.values())
             skipped_count = total_cloud_indexes - len(results)
             print(
@@ -285,8 +364,8 @@ class SearchWorker(QRunnable):
         output_folder,
         matcher_cache,
         append_store_name=False,
+        cancel_token=None,
         store_suffix_exclusions=None,
-        cancel_flag=None,
     ):
         super().__init__()
         self.setAutoDelete(True)
@@ -294,34 +373,42 @@ class SearchWorker(QRunnable):
         self.output_folder = output_folder
         self.matcher_cache = matcher_cache
         self.append_store_name = append_store_name
-        self.store_suffix_exclusions = normalise_store_suffix_exclusions(store_suffix_exclusions)
-        self.cancel_flag = cancel_flag
+        self.cancel_token = cancel_token
+        self.store_suffix_exclusions = normalise_store_suffix_exclusions(
+            store_suffix_exclusions
+        )
         self.signals = SearchSignals()
-    
+
     @Slot()
     def run(self):
         try:
             for delivery_item in self.delivery_items:
+                if self.cancel_token:
+                    self.cancel_token.raise_if_cancelled()
                 self._process_delivery(delivery_item)
             self.signals.all_finished.emit()
+        except OperationCancelled:
+            return
         except Exception as e:
             self.signals.error.emit(str(e))
-    
+
     def _process_delivery(self, delivery_item):
         store_name = delivery_item.store_name
         supply_type = delivery_item.supply_type
         index_store_name = f"{store_name}_{supply_type}"
-        
+
         type_data = get_type_data(store_name, supply_type)
-        matcher_name = type_data.get("matcher", "Simple")
-        cache_key = (index_store_name, matcher_name)
-        if cache_key not in self.matcher_cache:
-            self.matcher_cache[cache_key] = get_matcher_for_store(index_store_name)
-        matcher = self.matcher_cache[cache_key]
-        
+        if index_store_name not in self.matcher_cache:
+            self.matcher_cache[index_store_name] = get_matcher_for_store(
+                index_store_name,
+                type_data.get("matcher"),
+            )
+        matcher = self.matcher_cache[index_store_name]
+        allowed_extensions = {".png"} if type_data.get("png_only", False) else None
+
         base_output_folder = os.path.join(self.output_folder, "Найденные_принты_все")
         os.makedirs(base_output_folder, exist_ok=True)
-        
+
         folder_name = _delivery_output_folder_name(
             delivery_item.pdf_path,
             getattr(delivery_item, "display_store_name", store_name),
@@ -333,22 +420,22 @@ class SearchWorker(QRunnable):
         )
         output_folder = os.path.join(base_output_folder, folder_name)
         os.makedirs(output_folder, exist_ok=True)
-        
+
         not_found_items = []
-        
+
         for i in range(delivery_item.child_count()):
-            if self.cancel_flag and self.cancel_flag.is_canceled():
-                raise RuntimeError("Операция отменена")
+            if self.cancel_token:
+                self.cancel_token.raise_if_cancelled()
             article_item = delivery_item.child(i)
             article = article_item.article
             size = article_item.size
             location = article_item.location
-            
-            allowed_extensions = {".png"} if type_data.get("png_only", False) else None
+
             matches = matcher.find_file_by_article_and_size(
-                article, size, index_store_name, allowed_extensions=allowed_extensions
+                article, size, index_store_name,
+                allowed_extensions=allowed_extensions,
             )
-            
+
             if matches:
                 file = matches[0]
                 self.signals.article_status.emit(delivery_item, i, "Найден")
@@ -365,23 +452,31 @@ class SearchWorker(QRunnable):
                         suffix = f"[{size} СПИНА]" if size else "[СПИНА]"
                     else:
                         suffix = f"[{size}]" if size else ""
-                    
+
                     if suffix:
                         numbered_name = f"{i+1}. {base_name} {suffix}{ext}"
                     else:
                         numbered_name = f"{i+1}. {base_name}{ext}"
-                    
-                    target_path = os.path.join(output_folder, numbered_name)
-                    copy_resource(file, target_path)
+
+                    target_path = os.path.abspath(
+                        os.path.join(output_folder, numbered_name)
+                    )
+                    output_root = os.path.abspath(output_folder)
+                    if os.path.commonpath([output_root, target_path]) != output_root:
+                        raise ValueError("Недопустимое имя итогового файла")
+                    copy_resource(file, target_path, cancel_token=self.cancel_token)
                     self.signals.article_copied.emit(delivery_item, i, target_path)
+                except OperationCancelled:
+                    raise
                 except Exception as e:
                     print(f"[ПОИСК] Ошибка копирования {file}: {e}")
             else:
                 not_found_items.append((i + 1, article, size, location))
                 self.signals.article_status.emit(delivery_item, i, "Не найден")
-        
-        _sync_not_found_file(output_folder, not_found_items, self.cancel_flag)
-        
+
+        _sync_not_found_file(
+            output_folder, not_found_items, cancel_token=self.cancel_token
+        )
         self.signals.delivery_finished.emit(delivery_item)
 
 
@@ -396,25 +491,30 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Автосбор принтов по поставкам")
         self.setGeometry(100, 100, 1200, 700)
-        
+
         self.config_file = get_data_path("config.json")
         self.load_config()
-        
+
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(6)
-        
+        self.shutdown_token = CancellationToken()
+        self._shutdown_started = False
+        self._shutdown_dialog = None
+        self._shutdown_poll_timer = None
+        self._shutdown_deadline_timer = None
+
         self.pdf_files = []
         self.delivery_items = []
         self.matcher_cache = {}
         self.is_searching = False
         self._pending_restart_item = None
         self._last_toggle_time = 0  # Для debounce кликов
-        
+
         # ✅ Новое: диалог прогресса и флаг отмены
         self.parse_dialog = None
         self.cancel_flag = CancellationFlag()
         self.active_parse_workers = 0
-        
+
         self.setup_ui()
         self.setup_toolbar()
         self.setup_drag_drop()
@@ -427,6 +527,9 @@ class MainWindow(QMainWindow):
     def _schedule_next_cloud_auto_index(self):
         """Планирует ежедневное обновление на выбранное пользователем время."""
         self.cloud_auto_timer.stop()
+        if sys.platform.startswith("win"):
+            self.cloud_background_index_enabled = False
+            return
         if not self.cloud_background_index_enabled:
             print("[INDEX AUTO] Фоновое обновление облака отключено в настройках")
             return
@@ -450,13 +553,15 @@ class MainWindow(QMainWindow):
         )
 
     def _start_cloud_auto_index(self):
+        if sys.platform.startswith("win") or self.shutdown_token.is_cancelled():
+            return
         if not self.cloud_background_index_enabled:
             return
         if self.is_searching:
             print("[INDEX AUTO] Поиск занят; обновление отложено на 15 минут")
             self.cloud_auto_timer.start(self.CLOUD_AUTO_INDEX_RETRY_MS)
             return
-        self._cloud_auto_worker = CloudAutoIndexWorker()
+        self._cloud_auto_worker = CloudAutoIndexWorker(self.shutdown_token)
         self._cloud_auto_worker.signals.finished.connect(
             self._on_cloud_auto_index_finished
         )
@@ -466,11 +571,11 @@ class MainWindow(QMainWindow):
         self.matcher_cache.clear()
         self._cloud_auto_worker = None
         self._schedule_next_cloud_auto_index()
-    
+
     # ============================================
     # Конфигурация
     # ============================================
-    
+
     def load_config(self):
         config = {}
         if os.path.exists(self.config_file):
@@ -479,11 +584,15 @@ class MainWindow(QMainWindow):
                     config = json.load(f)
             except (OSError, json.JSONDecodeError):
                 config = {}
-        self.output_folder = config.get(
-            "output_folder", os.path.join(os.path.expanduser("~"), "Desktop")
-        )
-        self.cloud_background_index_enabled = bool(
-            config.get("cloud_background_index_enabled", True)
+        configured_output_folder = config.get("output_folder", "")
+        self.output_folder = _normalise_output_folder(configured_output_folder)
+        token_removed = config.pop("yandex_oauth_token", None) is not None
+        if token_removed and sys.platform.startswith("win"):
+            atomic_write_json(self.config_file, config)
+        self.cloud_background_index_enabled = (
+            False if sys.platform.startswith("win") else bool(
+                config.get("cloud_background_index_enabled", True)
+            )
         )
         self.cloud_background_index_time = str(
             config.get("cloud_background_index_time", "03:00")
@@ -503,9 +612,12 @@ class MainWindow(QMainWindow):
         self.store_display_names = dict(
             config.get("store_display_names", {}) or {}
         )
-        if not os.path.exists(self.config_file):
+        if (
+            not os.path.exists(self.config_file)
+            or configured_output_folder != self.output_folder
+        ):
             self.save_config()
-    
+
     def save_config(self):
         config = {}
         if os.path.exists(self.config_file):
@@ -514,6 +626,7 @@ class MainWindow(QMainWindow):
                     config = json.load(f)
             except (OSError, json.JSONDecodeError):
                 config = {}
+        config.pop("yandex_oauth_token", None)
         config.update({
             "search_folder": "",
             "output_folder": self.output_folder,
@@ -530,35 +643,35 @@ class MainWindow(QMainWindow):
             ),
             "store_display_names": self.store_display_names,
         })
-        with open(self.config_file, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-    
+        atomic_write_json(self.config_file, config)
+
+
     # ============================================
     # UI Setup
     # ============================================
-    
+
     def setup_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
+
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
-        
+
         self.tree_model = SupplyTreeModel()
         self.tree_view = SupplyTreeView()
         self.tree_view.set_model(self.tree_model)
-        
+
         self.override_delegate = OverrideButtonDelegate()
         self.override_delegate.override_clicked.connect(self.on_override_clicked)
         self.override_delegate.restart_clicked.connect(self.on_restart_clicked)
         self.tree_view.setItemDelegateForColumn(4, self.override_delegate)
-        
+
         # ✅ Пункт 1: Клик по строке поставки раскрывает/сворачивает
         self.tree_view.clicked.connect(self.on_tree_clicked)
-        
+
         layout.addWidget(self.tree_view, stretch=1)
-    
+
     def on_tree_clicked(self, index):
         """
         Пункт 1: Клик по parent-строке (не в колонке "Действия")
@@ -566,21 +679,21 @@ class MainWindow(QMainWindow):
         """
         if not index.isValid():
             return
-        
+
         item = index.internalPointer()
         if not isinstance(item, SupplyDeliveryItem):
             return
-        
+
         # Колонка 4 = "Действия" — не обрабатываем
         if index.column() == 4:
             return
-        
+
         # Toggle expand/collapse
         if self.tree_view.isExpanded(index):
             self.tree_view.collapse(index)
         else:
             self.tree_view.expand(index)
-    
+
     def setup_toolbar(self):
         toolbar = QToolBar()
         toolbar.setObjectName("mainToolbar")
@@ -602,30 +715,30 @@ class MainWindow(QMainWindow):
             button.setDefaultAction(action)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             toolbar_layout.addWidget(button)
-        
+
         self.load_action = QAction("📂 Загрузить", self)
         self.load_action.triggered.connect(self.load_pdfs)
         add_action_button(self.load_action)
-        
+
         self.run_action = QAction("▶️ Запустить", self)
         self.run_action.triggered.connect(self.run_all)
         add_action_button(self.run_action)
-        
+
         self.clear_action = QAction("🗑 Очистить", self)
         self.clear_action.triggered.connect(self.clear_table)
         add_action_button(self.clear_action)
-        
+
         separator = QFrame(toolbar_content)
         separator.setFrameShape(QFrame.Shape.VLine)
         separator.setFrameShadow(QFrame.Shadow.Sunken)
         toolbar_layout.addWidget(separator)
-        
+
         self.settings_action = QAction("⚙️ Настройки", self)
         self.settings_action.triggered.connect(self.open_settings)
         add_action_button(self.settings_action)
-        
+
         toolbar_layout.addStretch()
-        
+
         self.path_button = QPushButton()
         self.path_button.setObjectName("pathButton")
         self.path_button.setMinimumWidth(200)
@@ -634,7 +747,7 @@ class MainWindow(QMainWindow):
         self.path_button.clicked.connect(self.change_output_path)
         self._update_path_button_text()
         toolbar_layout.addWidget(self.path_button)
-    
+
     def _update_path_button_text(self):
         path = self.output_folder
         if len(path) > 60:
@@ -643,27 +756,31 @@ class MainWindow(QMainWindow):
             display = path
         self.path_button.setText(f"📁 {display}")
         self.path_button.setToolTip(f"Папка найденных принтов:\n{path}\n\nНажмите для изменения")
-    
+
     def change_output_path(self):
+        initial_folder = _normalise_output_folder(self.output_folder)
         folder = QFileDialog.getExistingDirectory(
-            self, "Выберите папку для найденных принтов", self.output_folder
+            self,
+            "Выберите папку для найденных принтов",
+            initial_folder,
+            _output_directory_dialog_options(),
         )
         if folder:
-            self.output_folder = folder
+            self.output_folder = _normalise_output_folder(folder)
             self._update_path_button_text()
             self.save_config()
-    
+
     # ============================================
     # Drag & Drop
     # ============================================
-    
+
     def setup_drag_drop(self):
         self.setAcceptDrops(True)
-    
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
-    
+
     def dropEvent(self, event):
         urls = event.mimeData().urls()
         pdf_paths = [
@@ -672,55 +789,55 @@ class MainWindow(QMainWindow):
         ]
         if pdf_paths:
             self.add_pdfs_to_table(pdf_paths)
-    
+
     # ============================================
     # Загрузка PDF
     # ============================================
-    
+
     def load_pdfs(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Выберите PDF-файлы поставок", "", "PDF files (*.pdf)"
         )
         if files:
             self.add_pdfs_to_table(files)
-    
+
     def add_pdfs_to_table(self, pdf_paths):
         """Добавляет PDF с показом диалога прогресса."""
         from PySide6.QtWidgets import QApplication
-        
+
         # Сбрасываем флаг отмены
         self.cancel_flag = CancellationFlag()
-        
+
         stores = load_stores()
         workers_to_start = []
-        
+
         # Подготовка данных
         for pdf_path in pdf_paths:
             if pdf_path in self.pdf_files:
                 continue
-            
+
             QApplication.processEvents()
-            
+
             detected = detect_supply_type(pdf_path)
             store_name = detected["store_name"]
             supply_type = detected["supply_type"]
-            
+
             store_data = stores.get(store_name, {})
             type_data = store_data.get(supply_type) if isinstance(store_data, dict) else None
-            
+
             if type_data:
                 folder = type_data["path"]
             else:
                 from gui.dialogs.new_store_dialog import NewStoreDialog
                 existing_types = list(store_data.keys()) if isinstance(store_data, dict) else []
-                
+
                 QApplication.processEvents()
                 dialog = NewStoreDialog(
                     self, pdf_path,
                     existing_store=bool(store_data),
                     existing_types=existing_types
                 )
-                
+
                 if dialog.exec():
                     store_name = dialog.result["store_name"]
                     supply_type = dialog.result["supply_type"]
@@ -728,9 +845,9 @@ class MainWindow(QMainWindow):
                     stores = load_stores()
                 else:
                     continue
-            
+
             self.pdf_files.append(pdf_path)
-            
+
             delivery_item = self.tree_model.add_delivery(
                 pdf_path,
                 store_name,
@@ -740,49 +857,49 @@ class MainWindow(QMainWindow):
             )
             self.tree_model.update_delivery_status(delivery_item, "Парсинг...")
             self.delivery_items.append(delivery_item)
-            
+
             worker = ParseWorker(pdf_path, delivery_item, supply_type, self.cancel_flag)
             worker.signals.started.connect(self._on_parse_started)
             worker.signals.finished.connect(self._on_parse_finished)
             worker.signals.error.connect(self._on_parse_error)
             workers_to_start.append((worker, pdf_path))
-            
+
             QApplication.processEvents()
-        
+
         if not workers_to_start:
             return
-        
+
         # ✅ Пункт 2: Создаём диалог прогресса
         self.active_parse_workers = len(workers_to_start)
         self.parse_dialog = ParseProgressDialog(len(workers_to_start), self)
         self.parse_dialog.canceled.connect(self.on_parse_canceled)
         self.parse_dialog.show()
-        
+
         # Запускаем worker'ы
         for worker, pdf_path in workers_to_start:
             if self.cancel_flag.is_canceled():
                 break
             self.thread_pool.start(worker)
             QApplication.processEvents()
-    
+
     def _on_parse_started(self, delivery_item, pdf_path):
         """Worker начал парсинг — обновляем диалог."""
         if self.parse_dialog and not self.cancel_flag.is_canceled():
             self.parse_dialog.set_current_file(pdf_path)
-    
+
     def _on_parse_finished(self, delivery_item, articles, sizes, locations, store_name):
         """Парсинг завершён — обновляем поставку и диалог."""
         # Игнорируем если была отмена
         if self.cancel_flag.is_canceled():
             return
-        
+
         if store_name and store_name != "UNKNOWN" and store_name != delivery_item.store_name:
             self.tree_model.update_store_name(
                 delivery_item,
                 store_name,
                 self._display_store_name(store_name),
             )
-        
+
         if not articles:
             self.tree_model.update_delivery_status(delivery_item, "Пусто")
         else:
@@ -792,25 +909,25 @@ class MainWindow(QMainWindow):
             self.tree_view.setExpanded(
                 delivery_index, self.auto_expand_delivery
             )
-        
+
         # Обновляем диалог прогресса
         if self.parse_dialog:
             self.parse_dialog.on_file_completed(delivery_item.pdf_path)
-    
+
     def _on_parse_error(self, delivery_item, error_message):
         """Ошибка парсинга."""
         if self.cancel_flag.is_canceled():
             return
-        
+
         self.tree_model.update_delivery_status(delivery_item, "Ошибка")
         QMessageBox.warning(
             self, "Ошибка парсинга",
             f"Не удалось распарсить {os.path.basename(delivery_item.pdf_path)}:\n{error_message}"
         )
-        
+
         if self.parse_dialog:
             self.parse_dialog.on_file_error(delivery_item.pdf_path)
-    
+
     def on_parse_canceled(self):
         """
         Пункт 2: Отмена парсинга.
@@ -819,60 +936,66 @@ class MainWindow(QMainWindow):
         - Worker'ы при следующей проверке флага завершатся без действий
         """
         self.cancel_flag.cancel()
-        
+
         # Очищаем список PDF, чтобы их можно было загрузить снова
         self.pdf_files.clear()
         self.delivery_items.clear()
         self.tree_model.clear()
-        
+
         QMessageBox.information(
             self, "Отмена",
             "Парсинг отменён. Таблица очищена.\n\n"
             "Примечание: запущенные worker'ы завершат свою работу в фоне, "
             "но их результаты будут проигнорированы."
         )
-    
+
     # ============================================
     # Очистка
     # ============================================
-    
+
     def clear_table(self):
         if not self.delivery_items:
             return
-        
+
         reply = QMessageBox.question(
             self, "Подтверждение",
             "Очистить все загруженные поставки?",
             QMessageBox.Yes | QMessageBox.No
         )
-        
+
         if reply != QMessageBox.Yes:
             return
-        
+
         self.pdf_files.clear()
         self.delivery_items.clear()
         self.tree_model.clear()
-    
+
     # ============================================
     # Override
     # ============================================
-    
-    def _remember_override_for_article(self, delivery_item, article, file_path, status):
-        indices = _matching_article_indices(delivery_item, article)
+
+    def _remember_override_for_article(
+        self, delivery_item, article, file_path, status
+    ):
+        matching_indices = _matching_article_indices(delivery_item, article)
+        article_sizes = [
+            (delivery_item.child(index).article, delivery_item.child(index).size)
+            for index in matching_indices
+        ]
         set_overrides(
             delivery_item.store_name,
             delivery_item.supply_type,
-            [(delivery_item.child(i).article, delivery_item.child(i).size) for i in indices],
+            article_sizes,
             file_path,
         )
-        for index in indices:
+        for index in matching_indices:
             self.tree_model.update_article_status(delivery_item, index, status)
-        return len(indices)
+        return len(matching_indices)
 
     def on_override_clicked(self, delivery_item, article_index):
         """
         Обработка клика по кнопке 'Уточнить' для артикула.
-        
+
         Логика:
         - Если copy_on_override = False → запоминаем путь в manual_overrides.json
         - Если copy_on_override = True:
@@ -881,7 +1004,7 @@ class MainWindow(QMainWindow):
         """
         if article_index >= delivery_item.child_count():
             return
-        
+
         article_item = delivery_item.child(article_index)
         article = article_item.article
         size = article_item.size
@@ -892,22 +1015,34 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText(article)
         type_data = get_type_data(store_name, supply_type)
         if type_data.get("source") == "yandex":
+            if sys.platform.startswith("win"):
+                QMessageBox.information(
+                    self, "Яндекс Диск недоступен",
+                    "Яндекс Диск временно недоступен в Windows-версии."
+                )
+                return
             picker = YandexDiskPickerDialog(
-                select_file=True, initial_path=type_data.get("path", ""), parent=self
+                select_file=True,
+                initial_path=type_data.get("path", ""),
+                parent=self,
             )
             if picker.exec() != QDialog.Accepted:
                 return
             linked_count = self._remember_override_for_article(
-                delivery_item, article, picker.selected_path, "Уточнён (Яндекс Диск)"
+                delivery_item, article, picker.selected_path,
+                "Уточнён (Яндекс Диск)",
             )
             QMessageBox.information(
-                self, "Успех", f"Облачный файл привязан к {linked_count} поз."
+                self, "Успех",
+                f"Облачный файл привязан к {linked_count} поз.",
             )
             return
 
+        initial_directory = _override_dialog_directory(
+            type_data.get("path", ""), delivery_item.folder
+        )
         file_path, _ = QFileDialog.getOpenFileName(
-            self, f"Укажите путь артикула {article}",
-            _override_dialog_directory(type_data.get("path", ""), delivery_item.folder),
+            self, f"Укажите путь артикула {article}", initial_directory,
             "Изображения (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp);;Все файлы (*.*)"
         )
         if not file_path:
@@ -916,50 +1051,51 @@ class MainWindow(QMainWindow):
         copy_on_override = type_data.get("copy_on_override", False)
         override_path = type_data.get("override_path", "")
         index_store_name = f"{store_name}_{supply_type}"
-        
+
         if not copy_on_override:
             # === Режим "Только запомнить путь" ===
             linked_count = self._remember_override_for_article(
                 delivery_item, article, file_path, "Уточнён (override)"
             )
             QMessageBox.information(
-                self, "Успех", f"Путь сохранён для {linked_count} поз.:\n{file_path}"
+                self, "Успех",
+                f"Путь сохранён для {linked_count} поз.:\n{file_path}",
             )
             return
-        
+
         # === Режим "Копировать и переименовывать" ===
-        
+
         # Определяем корневую папку для операций
         target_root = override_path if override_path else delivery_item.folder
-        
+
         if not target_root:
             QMessageBox.warning(
                 self, "Ошибка",
                 "Не указан путь для копирования. Укажите его в настройках магазина."
             )
             return
-        
+
         # Нормализуем пути для точного сравнения
         file_norm = os.path.normpath(os.path.realpath(file_path))
         root_norm = os.path.normpath(os.path.realpath(target_root))
-        
+
         # Проверяем: находится ли файл внутри target_root (или его подпапок)
         # Используем разделитель для точного совпадения префикса
         is_in_root = (
             file_norm == root_norm or
             file_norm.startswith(root_norm + os.sep)
         )
-        
+
         _, ext = os.path.splitext(file_path)
         new_filename = f"{article}{ext}"
-        
+
         try:
             if is_in_root:
                 # === Файл уже в папке магазина → переименовываем на месте ===
                 current_dir = os.path.dirname(file_path)
                 new_path = os.path.join(current_dir, new_filename)
                 new_path_norm = os.path.normpath(new_path)
-                
+
                 # Если файл уже назван правильно — ничего не делаем
                 if file_norm == new_path_norm:
                     QMessageBox.information(
@@ -980,7 +1116,7 @@ class MainWindow(QMainWindow):
                         )
                         if reply != QMessageBox.Yes:
                             return
-                        
+
                         # Удаляем конфликтующий файл
                         try:
                             os.remove(new_path)
@@ -990,7 +1126,7 @@ class MainWindow(QMainWindow):
                                 f"Не удалось удалить конфликтующий файл:\n{e}"
                             )
                             return
-                    
+
                     # Переименовываем
                     os.rename(file_path, new_path)
                     print(f"[OVERRIDE] Переименован: {file_path} → {new_path}")
@@ -1005,9 +1141,9 @@ class MainWindow(QMainWindow):
                 # === Файл извне → копируем в overrided ===
                 overrided_dir = os.path.join(target_root, "overrided")
                 os.makedirs(overrided_dir, exist_ok=True)
-                
+
                 new_path = os.path.join(overrided_dir, new_filename)
-                
+
                 # Проверка: нет ли конфликта имен
                 if os.path.exists(new_path):
                     reply = QMessageBox.question(
@@ -1018,7 +1154,7 @@ class MainWindow(QMainWindow):
                     )
                     if reply != QMessageBox.Yes:
                         return
-                    
+
                     try:
                         os.remove(new_path)
                     except Exception as e:
@@ -1027,7 +1163,7 @@ class MainWindow(QMainWindow):
                             f"Не удалось удалить конфликтующий файл:\n{e}"
                         )
                         return
-                
+
                 # Копируем
                 shutil.copy2(file_path, new_path)
                 print(f"[OVERRIDE] Скопирован: {file_path} → {new_path}")
@@ -1038,7 +1174,7 @@ class MainWindow(QMainWindow):
                 self.tree_model.update_article_status(
                     delivery_item, article_index, "Уточнён (скопирован)"
                 )
-            
+
             # После операций обновляем только изменившиеся файлы индекса.
             update_index_for_store(
                 index_store_name,
@@ -1046,54 +1182,54 @@ class MainWindow(QMainWindow):
                 override_path=override_path,
                 force=True
             )
-        
+
         except Exception as e:
             QMessageBox.critical(
                 self, "Ошибка",
                 f"Не удалось обработать файл:\n{e}"
             )
-    
+
     def on_restart_clicked(self, delivery_item):
         if self.is_searching:
             QMessageBox.information(self, "Информация", "Дождитесь завершения текущего поиска")
             return
-        
+
         reply = QMessageBox.question(
             self, "Подтверждение",
             f"Перезапустить поиск для поставки:\n{os.path.basename(delivery_item.pdf_path)}?\n\n"
             f"Все скопированные файлы будут удалены.",
             QMessageBox.Yes | QMessageBox.No
         )
-        
+
         if reply != QMessageBox.Yes:
             return
-        
-        try:
-            for i in range(delivery_item.child_count()):
-                copied_file = delivery_item.child(i).copied_file
-                if copied_file and os.path.isfile(copied_file):
-                    os.remove(copied_file)
-            if delivery_item.output_folder:
-                _sync_not_found_file(delivery_item.output_folder, [])
-        except OSError as error:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось очистить результаты:\n{error}")
-            return
-        
+
+        if delivery_item.output_folder and os.path.exists(delivery_item.output_folder):
+            try:
+                shutil.rmtree(delivery_item.output_folder)
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Ошибка повторного поиска",
+                    "Не удалось очистить папку предыдущего результата.\n\n"
+                    f"{delivery_item.output_folder}\n\n{e}",
+                )
+                return
+
         for i in range(delivery_item.child_count()):
             self.tree_model.update_article_status(delivery_item, i, "Ожидание")
             delivery_item.child(i).copied_file = None
         self.tree_model.update_delivery_status(delivery_item, "Ожидание")
-        
+
         self.is_searching = True
         self._set_actions_enabled(False)
-        
+
         store_name = delivery_item.store_name
         supply_type = delivery_item.supply_type
         key = f"{store_name}_{supply_type}"
-        
+
         type_data = get_type_data(store_name, supply_type)
         override_path = type_data.get("override_path") if type_data.get("copy_on_override") else None
-        
+
         unique_stores = {
             key: {
                 "store_name": store_name,
@@ -1104,10 +1240,19 @@ class MainWindow(QMainWindow):
                 "source": type_data.get("source", "local"),
             }
         }
-        
+
         self._pending_restart_item = delivery_item
 
         if type_data.get("source", "local") == "yandex":
+            if sys.platform.startswith("win"):
+                self._pending_restart_item = None
+                self.is_searching = False
+                self._set_actions_enabled(True)
+                QMessageBox.information(
+                    self, "Яндекс Диск недоступен",
+                    "Для этого магазина выберите локальную или сетевую папку."
+                )
+                return
             cloud_path = type_data.get("path", "").strip()
             if not has_yandex_index_for_store(key, cloud_path):
                 self._pending_restart_item = None
@@ -1125,28 +1270,28 @@ class MainWindow(QMainWindow):
             )
             self._on_restart_index_finished()
             return
-        
-        worker = IndexRebuildWorker(unique_stores)
+
+        worker = IndexRebuildWorker(unique_stores, self.shutdown_token)
         worker.signals.finished.connect(self._on_restart_index_finished)
         worker.signals.error.connect(self._on_index_error)
         self.thread_pool.start(worker)
-    
+
     def _on_restart_index_finished(self):
         delivery_item = self._pending_restart_item
         if not delivery_item:
             self.is_searching = False
             self._set_actions_enabled(True)
             return
-        
+
         self.tree_model.update_delivery_status(delivery_item, "Поиск...")
-        
+
         worker = SearchWorker(
             [delivery_item],
             self.output_folder,
             self.matcher_cache,
             self.append_store_to_delivery_folder,
-            self.store_suffix_exclusions,
-            self.cancel_flag,
+            self.shutdown_token,
+            store_suffix_exclusions=self.store_suffix_exclusions,
         )
         worker.signals.article_status.connect(self._on_article_status)
         worker.signals.article_copied.connect(self._on_article_copied)
@@ -1154,27 +1299,29 @@ class MainWindow(QMainWindow):
         worker.signals.all_finished.connect(self._on_search_finished)
         worker.signals.error.connect(self._on_search_error)
         self.thread_pool.start(worker)
-        
+
         self._pending_restart_item = None
-    
+
     def _on_index_error(self, error_message):
+        if self._shutdown_started:
+            return
         self.is_searching = False
         self._set_actions_enabled(True)
         QMessageBox.critical(self, "Ошибка", f"Ошибка обновления индексов:\n{error_message}")
-    
+
     # ============================================
     # Запуск поиска
     # ============================================
-    
+
     def run_all(self):
         if self.is_searching:
             QMessageBox.information(self, "Информация", "Поиск уже идёт")
             return
-        
+
         if not self.delivery_items:
             QMessageBox.information(self, "Информация", "Нет загруженных поставок")
             return
-        
+
         unique_stores = {}
         processed_store_keys = set()
         missing_cloud_indexes = []
@@ -1182,12 +1329,17 @@ class MainWindow(QMainWindow):
             store_name = delivery_item.store_name
             supply_type = delivery_item.supply_type
             key = f"{store_name}_{supply_type}"
-            
+
             if key not in processed_store_keys:
                 processed_store_keys.add(key)
                 type_data = get_type_data(store_name, supply_type)
                 source = type_data.get("source", "local")
                 if source == "yandex":
+                    if sys.platform.startswith("win"):
+                        missing_cloud_indexes.append(
+                            f"{store_name} ({supply_type}) — Яндекс Диск недоступен"
+                        )
+                        continue
                     cloud_path = type_data.get("path", "").strip()
                     if not has_yandex_index_for_store(key, cloud_path):
                         missing_cloud_indexes.append(
@@ -1200,7 +1352,7 @@ class MainWindow(QMainWindow):
                         )
                     continue
                 override_path = type_data.get("override_path") if type_data.get("copy_on_override") else None
-                
+
                 unique_stores[key] = {
                     "store_name": store_name,
                     "supply_type": supply_type,
@@ -1214,7 +1366,7 @@ class MainWindow(QMainWindow):
                 self, "Требуется индекс",
                 "Для облачных магазинов не подготовлены индексы:\n\n"
                 + "\n".join(missing_cloud_indexes)
-                + "\n\nОткройте настройки и выполните ручную полную сверку."
+                + "\n\nВ Windows-версии используйте локальную или сетевую папку."
             )
             return
 
@@ -1224,31 +1376,31 @@ class MainWindow(QMainWindow):
             self._on_index_finished()
             return
 
-        worker = IndexRebuildWorker(unique_stores)
+        worker = IndexRebuildWorker(unique_stores, self.shutdown_token)
         worker.signals.finished.connect(self._on_index_finished)
         worker.signals.error.connect(self._on_index_error)
         self.thread_pool.start(worker)
-    
+
     def _set_actions_enabled(self, enabled):
         self.load_action.setEnabled(enabled)
         self.run_action.setEnabled(enabled)
         self.clear_action.setEnabled(enabled)
         self.settings_action.setEnabled(enabled)
-    
+
     def _on_index_finished(self):
         for delivery_item in self.delivery_items:
             for i in range(delivery_item.child_count()):
                 self.tree_model.update_article_status(delivery_item, i, "Ожидание")
                 delivery_item.child(i).copied_file = None
             self.tree_model.update_delivery_status(delivery_item, "Поиск...")
-        
+
         worker = SearchWorker(
             self.delivery_items,
             self.output_folder,
             self.matcher_cache,
             self.append_store_to_delivery_folder,
-            self.store_suffix_exclusions,
-            self.cancel_flag,
+            self.shutdown_token,
+            store_suffix_exclusions=self.store_suffix_exclusions,
         )
         worker.signals.article_status.connect(self._on_article_status)
         worker.signals.article_copied.connect(self._on_article_copied)
@@ -1256,13 +1408,13 @@ class MainWindow(QMainWindow):
         worker.signals.all_finished.connect(self._on_search_finished)
         worker.signals.error.connect(self._on_search_error)
         self.thread_pool.start(worker)
-    
+
     def _on_article_status(self, delivery_item, article_index, status):
         self.tree_model.update_article_status(delivery_item, article_index, status)
-    
+
     def _on_article_copied(self, delivery_item, article_index, file_path):
         self.tree_model.set_article_copied_file(delivery_item, article_index, file_path)
-    
+
     def _on_delivery_finished(self, delivery_item):
         base_output_folder = os.path.join(self.output_folder, "Найденные_принты_все")
         folder_name = _delivery_output_folder_name(
@@ -1279,11 +1431,13 @@ class MainWindow(QMainWindow):
             ),
         )
         output_folder = os.path.join(base_output_folder, folder_name)
-        
+
         delivery_item.output_folder = output_folder
         self.tree_model.update_delivery_status(delivery_item, "Готово")
-    
+
     def _on_search_finished(self):
+        if self._shutdown_started:
+            return
         self.is_searching = False
         self._set_actions_enabled(True)
         results_folder = os.path.join(
@@ -1292,12 +1446,14 @@ class MainWindow(QMainWindow):
         if self.open_results_folder and os.path.isdir(results_folder):
             QDesktopServices.openUrl(QUrl.fromLocalFile(results_folder))
         QMessageBox.information(self, "Готово", "Обработка всех поставок завершена")
-    
+
     def _on_search_error(self, error_message):
+        if self._shutdown_started:
+            return
         self.is_searching = False
         self._set_actions_enabled(True)
         QMessageBox.critical(self, "Ошибка", f"Ошибка поиска:\n{error_message}")
-    
+
     # ============================================
     # Диалоги
     # ============================================
@@ -1305,7 +1461,7 @@ class MainWindow(QMainWindow):
     def _display_store_name(self, store_name):
         display_name = str(self.store_display_names.get(store_name, "")).strip()
         return display_name or store_name
-    
+
     def open_settings(self):
         from gui.settings_window import SettingsWindow
         dialog = SettingsWindow(self)
@@ -1316,14 +1472,69 @@ class MainWindow(QMainWindow):
         self.tree_model.refresh_store_display_names(self.store_display_names)
         self._schedule_next_cloud_auto_index()
 
+    def _finish_windows_shutdown(self):
+        if self._shutdown_poll_timer:
+            self._shutdown_poll_timer.stop()
+        if self._shutdown_deadline_timer:
+            self._shutdown_deadline_timer.stop()
+        if self._shutdown_dialog:
+            self._shutdown_dialog.close()
+        QApplication.instance().quit()
+
+    def _poll_windows_shutdown(self):
+        pools_idle = (
+            self.thread_pool.activeThreadCount() == 0
+            and QThreadPool.globalInstance().activeThreadCount() == 0
+        )
+        if pools_idle:
+            self._finish_windows_shutdown()
+
+    def _force_windows_shutdown(self):
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(0)
+
+    def _start_windows_shutdown(self):
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        self.shutdown_token.cancel()
+        self.cancel_flag.cancel()
+        self.cloud_auto_timer.stop()
+        self.thread_pool.clear()
+        QThreadPool.globalInstance().clear()
+        self.hide()
+        self._shutdown_dialog = QProgressDialog(
+            "Останавливаются фоновые операции…", "", 0, 0, None
+        )
+        self._shutdown_dialog.setWindowTitle("Завершение работы")
+        self._shutdown_dialog.setCancelButton(None)
+        self._shutdown_dialog.setMinimumDuration(0)
+        self._shutdown_dialog.setWindowModality(Qt.ApplicationModal)
+        self._shutdown_dialog.setWindowFlag(Qt.WindowCloseButtonHint, False)
+        self._shutdown_dialog.show()
+        self._shutdown_poll_timer = QTimer(self)
+        self._shutdown_poll_timer.timeout.connect(self._poll_windows_shutdown)
+        self._shutdown_poll_timer.start(100)
+        self._shutdown_deadline_timer = QTimer(self)
+        self._shutdown_deadline_timer.setSingleShot(True)
+        self._shutdown_deadline_timer.timeout.connect(self._force_windows_shutdown)
+        self._shutdown_deadline_timer.start(15_000)
+        self._poll_windows_shutdown()
+
     def closeEvent(self, event):
-        """Красная кнопка скрывает окно, не останавливая фоновые задачи."""
+        if sys.platform.startswith("win"):
+            event.ignore()
+            QTimer.singleShot(0, self._start_windows_shutdown)
+            return
         if getattr(self, "allow_quit", False) or not event.spontaneous():
             event.accept()
             return
         event.ignore()
         self.hide()
-    
+
     def open_logs(self):
         from gui.dialogs.log_window import LogWindow
         dialog = LogWindow(self)

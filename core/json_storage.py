@@ -1,23 +1,25 @@
+"""Safe JSON persistence helpers."""
+from __future__ import annotations
+
 import json
 import os
-import tempfile
+from typing import Any
 
 
-def atomic_write_json(path, data):
+def atomic_write_json(path: str, value: Any) -> None:
+    """Write JSON atomically so an interrupted process cannot corrupt it."""
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=os.path.basename(path) + ".", suffix=".part", dir=directory
-    )
+    temporary = path + ".tmp"
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(data, stream, ensure_ascii=False, indent=2)
-            stream.flush()
-            os.fsync(stream.fileno())
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(value, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
         os.replace(temporary, path)
     except Exception:
         try:
             os.remove(temporary)
-        except FileNotFoundError:
+        except OSError:
             pass
         raise

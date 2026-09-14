@@ -13,12 +13,18 @@ from PySide6.QtWidgets import QApplication, QDialog
 from core.cancellation import CancellationToken, OperationCancelled
 from gui.main_window import (
     MainWindow,
+    SearchWorker,
     _delivery_output_folder_name,
     _matching_article_indices,
     _override_dialog_directory,
     _sync_not_found_file,
 )
-from matcher import SimpleMatcher
+from matcher import (
+    AlekseevMatcher,
+    SimpleMatcher,
+    get_matcher_options,
+    resolve_matcher_name,
+)
 from core.personalization import (
     normalise_store_suffix_exclusions,
     should_append_store_suffix,
@@ -252,17 +258,67 @@ class MatcherExtensionFilterTests(unittest.TestCase):
             )
         self.assertEqual(result, index["A"])
 
-    def test_unknown_configured_matcher_falls_back_to_simple(self):
-        import matcher as matcher_module
 
-        with patch.object(matcher_module, "_migrate_legacy_matchers"), patch(
-            "matcher.get_type_data", return_value={"matcher": "Unknown"}
-        ):
-            self.assertIsInstance(
-                matcher_module.get_matcher_for_store("Store_WB"),
-                matcher_module.SimpleMatcher,
+
+class MatcherSelectionTests(unittest.TestCase):
+    def test_available_matchers_match_implemented_classes(self):
+        names = [name for name, _label in get_matcher_options()]
+        self.assertEqual(
+            names,
+            ["Simple", "Rozenberg", "Alekseev", "PdfOnly", "Kristabell"],
+        )
+
+    def test_explicit_matcher_wins_and_legacy_yaml_remains_fallback(self):
+        legacy = {
+            "matcher_map": {"Legacy_WB": "Alekseev"},
+            "default_matcher": "PdfOnly",
+        }
+        with patch("matcher.load_matcher_config", return_value=legacy):
+            self.assertEqual(
+                resolve_matcher_name("Legacy_WB", "Kristabell"),
+                "Kristabell",
+            )
+            self.assertEqual(
+                resolve_matcher_name("Legacy_WB", None),
+                "Alekseev",
+            )
+            self.assertEqual(
+                resolve_matcher_name("Unknown_WB", "Invalid"),
+                "PdfOnly",
             )
 
+    def test_explicit_matcher_class_is_used(self):
+        from matcher import get_matcher_for_store
+
+        self.assertIsInstance(
+            get_matcher_for_store("Any_WB", "Alekseev"),
+            AlekseevMatcher,
+        )
+    def test_search_worker_uses_matcher_saved_for_store_type(self):
+        import gui.main_window as main_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            delivery = SimpleNamespace(
+                store_name="Shop",
+                supply_type="WB",
+                pdf_path=str(Path(directory) / "Delivery.pdf"),
+                display_store_name="Shop",
+                child_count=lambda: 0,
+            )
+            fake_matcher = Mock()
+            with patch.object(
+                main_module,
+                "get_type_data",
+                return_value={"matcher": "Alekseev", "png_only": False},
+            ), patch.object(
+                main_module,
+                "get_matcher_for_store",
+                return_value=fake_matcher,
+            ) as matcher_factory:
+                worker = SearchWorker([delivery], directory, {})
+                worker._process_delivery(delivery)
+
+            matcher_factory.assert_called_once_with("Shop_WB", "Alekseev")
 
 class SettingsWindowTests(unittest.TestCase):
     @classmethod
@@ -274,6 +330,7 @@ class SettingsWindowTests(unittest.TestCase):
             f"Store {number:02d}": {
                 "WB": {
                     "path": "",
+                    "matcher": "Simple",
                     "copy_on_override": False,
                     "override_path": "",
                     "source": "local",
@@ -281,6 +338,7 @@ class SettingsWindowTests(unittest.TestCase):
                 },
                 "OZON": {
                     "path": "",
+                    "matcher": "Simple",
                     "copy_on_override": False,
                     "override_path": "",
                     "source": "local",
@@ -348,7 +406,35 @@ class SettingsWindowTests(unittest.TestCase):
                 self.app.processEvents()
 
 
+    def test_matcher_is_saved_independently_and_resets_runtime_cache(self):
+        import gui.settings_window as settings_module
+
+        stores = self._stores(count=1)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            settings_module, "load_stores", return_value=stores
+        ), patch.object(
+            settings_module, "get_data_path",
+            side_effect=lambda name: str(Path(directory) / name),
+        ), patch.object(
+            settings_module, "OVERRIDES_FILE", str(Path(directory) / "overrides.json")
+        ), patch.object(settings_module, "save_stores") as save_mock:
+            window = settings_module.SettingsWindow()
+            try:
+                window._on_matcher_changed("WB", "PdfOnly")
+                self.assertEqual(
+                    window.stores["Store 00"]["WB"]["matcher"], "PdfOnly"
+                )
+                self.assertEqual(
+                    window.stores["Store 00"]["OZON"]["matcher"], "Simple"
+                )
+                self.assertTrue(window.needs_reset_cache)
+                self.assertTrue(save_mock.called)
+            finally:
+                window.close()
+                self.app.processEvents()
+
 class RestartSearchTests(unittest.TestCase):
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -358,12 +444,9 @@ class RestartSearchTests(unittest.TestCase):
         import gui.main_window as main_module
 
         window = main_module.MainWindow()
-        child = SimpleNamespace(copied_file="/locked/result.png")
         delivery = SimpleNamespace(
             output_folder=r"C:\locked\delivery",
             pdf_path=r"C:\pdf\delivery.pdf",
-            child_count=lambda: 1,
-            child=lambda _index: child,
         )
         try:
             with patch.object(
@@ -373,9 +456,9 @@ class RestartSearchTests(unittest.TestCase):
             ), patch.object(
                 main_module.QMessageBox, "critical"
             ) as critical, patch.object(
-                main_module.os.path, "isfile", return_value=True
+                main_module.os.path, "exists", return_value=True
             ), patch.object(
-                main_module.os, "remove", side_effect=PermissionError("locked")
+                main_module.shutil, "rmtree", side_effect=PermissionError("locked")
             ):
                 window.on_restart_clicked(delivery)
 

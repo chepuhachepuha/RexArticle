@@ -1,8 +1,8 @@
 import json
 import os
-from core.json_storage import atomic_write_json
 
 from core.paths import get_data_path
+from core.json_storage import atomic_write_json
 
 OVERRIDES_FILE = get_data_path("manual_overrides.json")
 
@@ -54,13 +54,17 @@ def get_override(store_name, supply_type, article, size):
     return overrides.get(key, {}).get(sub_key)
 
 def set_overrides(store_name, supply_type, article_sizes, file_path):
+    """Atomically bind one file to several article/size override keys."""
+    pairs = list(article_sizes)
+    if not pairs:
+        return
+
     overrides = _load_to_cache()
     key = _build_key(store_name, supply_type)
     store_overrides = overrides.setdefault(key, {})
-    for article, size in article_sizes:
+    for article, size in pairs:
         store_overrides[_build_sub_key(article, size)] = file_path
     save_overrides(overrides)
-
 
 def set_override(store_name, supply_type, article, size, file_path):
     set_overrides(store_name, supply_type, [(article, size)], file_path)
@@ -96,15 +100,15 @@ def clear_overrides_for_store(store_name, supply_type=None):
 if __name__ == "__main__":
     print("Тест set_override...")
     set_override("Бренд Рекспринт", "WB", "f_i_rats_b_04", "XS", "C:/manual/f_i_rats_b_04.png")
-    
+
     print("Тест get_override...")
     path = get_override("Бренд Рекспринт", "WB", "f_i_rats_b_04", "XS")
     print(f"Найден путь: {path}")
-    
+
     print("Тест get_all_overrides_for_store...")
     all_overrides = get_all_overrides_for_store("Бренд Рекспринт", "WB")
     print(f"Все overrides: {all_overrides}")
-    
+
     print("Тест remove_override...")
     remove_override("Бренд Рекспринт", "WB", "f_i_rats_b_04", "XS")
     path_after = get_override("Бренд Рекспринт", "WB", "f_i_rats_b_04", "XS")

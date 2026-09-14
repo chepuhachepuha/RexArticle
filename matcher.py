@@ -3,21 +3,18 @@ import yaml
 import re
 from manual_overrides import get_override
 from indexer import get_index_for_store
-from core.paths import resource_path, get_data_path
-from core.store_manager import load_stores, save_stores, get_type_data
-from core.json_storage import atomic_write_json
+from core.paths import resource_path
 from core.yandex_disk import is_yandex_uri
 
 CONFIG_PATH = resource_path("config_matcher.yaml")
 _config_cache = None
-_legacy_migration_checked = False
 
 
 def load_matcher_config():
     global _config_cache
     if _config_cache is not None:
         return _config_cache
-    
+
     if not os.path.exists(CONFIG_PATH):
         default_config = {
             "matcher_map": {},
@@ -27,7 +24,7 @@ def load_matcher_config():
             yaml.dump(default_config, f, ensure_ascii=False, default_flow_style=False)
         _config_cache = default_config
         return _config_cache
-    
+
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
         _config_cache = yaml.safe_load(f)
     return _config_cache
@@ -44,7 +41,7 @@ class BaseMatcher:
         if article in index:
             return index[article]
         return []
-    
+
     def _check_manual_override(self, article, size_from_pdf, store_name):
         if "_" in store_name:
             parts = store_name.rsplit("_", 1)
@@ -85,7 +82,7 @@ class SimpleMatcher(BaseMatcher):
     Matcher по умолчанию. Ищет по точному совпадению артикула.
     Исключает .jpg файлы — ищет во всех остальных форматах.
     """
-    
+
     # Расширения, которые исключаем из поиска
     EXCLUDED_EXTENSIONS = {'.jpg'}
 
@@ -128,7 +125,7 @@ class AlekseevMatcher(BaseMatcher):
             index = get_index_for_store(store)
             if art in index:
                 return index[art]
-            
+
             clean_article = re.sub(r'(Black|White)$', '', art)
             if clean_article in index:
                 return index[clean_article]
@@ -164,7 +161,7 @@ class KristabellMatcher(BaseMatcher):
             index = get_index_for_store(store)
 
             clean_article = art.replace("/", " ")
-            
+
             size_upper = size.upper().strip() if size else ""
             if size_upper in ["XS", "S", "M", "L", "XL"]:
                 range_suffix = "(XS_XL)"
@@ -174,9 +171,9 @@ class KristabellMatcher(BaseMatcher):
                 if clean_article in index:
                     return index[clean_article]
                 return []
-            
+
             search_key = f"{clean_article} {range_suffix}"
-            
+
             if search_key in index:
                 return index[search_key]
             return []
@@ -195,47 +192,36 @@ MATCHER_CLASSES = {
     "Kristabell": KristabellMatcher,
 }
 
-
-def _migrate_legacy_matchers():
-    global _legacy_migration_checked
-    if _legacy_migration_checked:
-        return
-    _legacy_migration_checked = True
-    config_path = get_data_path("config.json")
-    app_config = {}
-    try:
-        if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as stream:
-                app_config = __import__("json").load(stream)
-    except (OSError, ValueError):
-        app_config = {}
-    if app_config.get("matcher_settings_migrated"):
-        return
-    legacy_map = load_matcher_config().get("matcher_map", {})
-    stores = load_stores()
-    changed = False
-    for index_name, matcher_name in legacy_map.items():
-        if matcher_name not in MATCHER_CLASSES or "_" not in index_name:
-            continue
-        store_name, supply_type = index_name.rsplit("_", 1)
-        if supply_type in stores.get(store_name, {}):
-            stores[store_name][supply_type]["matcher"] = matcher_name
-            changed = True
-    if changed:
-        save_stores(stores)
-    app_config["matcher_settings_migrated"] = True
-    atomic_write_json(config_path, app_config)
+MATCHER_LABELS = {
+    "Simple": "Simple — точное совпадение",
+    "Rozenberg": "Rozenberg — артикул до дефиса",
+    "Alekseev": "Alekseev — суффиксы Black/White",
+    "PdfOnly": "PdfOnly — только PDF",
+    "Kristabell": "Kristabell — диапазоны размеров",
+}
 
 
-def get_matcher_for_store(store_name):
-    _migrate_legacy_matchers()
-    matcher_name = "Simple"
-    if "_" in store_name:
-        actual_store, supply_type = store_name.rsplit("_", 1)
-        matcher_name = get_type_data(actual_store, supply_type).get("matcher", "Simple")
-    matcher_class = MATCHER_CLASSES.get(matcher_name)
-    
-    if matcher_class:
-        return matcher_class()
-    else:
-        return SimpleMatcher()
+def get_matcher_options():
+    """Return stable matcher names and user-facing descriptions."""
+    return [
+        (name, MATCHER_LABELS.get(name, name))
+        for name in MATCHER_CLASSES
+    ]
+
+
+def resolve_matcher_name(store_name, preferred_name=None):
+    """Resolve an explicit per-store matcher with legacy YAML fallback."""
+    if preferred_name in MATCHER_CLASSES:
+        return preferred_name
+
+    config = load_matcher_config() or {}
+    matcher_name = config.get("matcher_map", {}).get(
+        store_name,
+        config.get("default_matcher", "Simple"),
+    )
+    return matcher_name if matcher_name in MATCHER_CLASSES else "Simple"
+
+
+def get_matcher_for_store(store_name, matcher_name=None):
+    resolved_name = resolve_matcher_name(store_name, matcher_name)
+    return MATCHER_CLASSES[resolved_name]()

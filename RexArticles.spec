@@ -22,9 +22,6 @@ our_datas = [
     ('styles/logs.qss', 'styles'),
     ('styles/theme.py', 'styles'),
     ('config_matcher.yaml', '.'),
-    ('config.json', '.'),
-    ('stores.json', '.'),
-    ('manual_overrides.json', '.'),
     ('icon.icns', '.'),
 ]
 
@@ -38,6 +35,7 @@ a = Analysis(
         'parser', 'ozon_parser', 'ozon_marker', 'supply_detector',
         'indexer', 'matcher', 'manual_overrides',
         'core.paths', 'core.logger', 'core.store_manager', 'core.pdf_cache',
+        'core.cancellation', 'core.json_storage',
         'core.yandex_disk', 'core.storage_backend',
         'gui.main_window', 'gui.settings_window',
         'gui.dialogs.new_store_dialog', 'gui.dialogs.log_window',

@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+from core.text_normalization import normalize_article
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -172,6 +173,7 @@ def _scan_files(roots: list[dict], progress_callback=None, cancel_token=None) ->
                 cancel_token.raise_if_cancelled()
             try:
                 article, extension = os.path.splitext(entry.name)
+                article = normalize_article(article)
 
                 if is_network and extension.lower() in _SUPPORTED_EXTENSIONS:
                     # На WebDAV stat/is_file часто означает отдельный сетевой
@@ -242,7 +244,7 @@ def _index_from_files(files: dict) -> dict:
         key=lambda item: (item[1]["article"].casefold(), item[1]["priority"], item[0].casefold()),
     )
     for file_path, info in ordered:
-        index.setdefault(info["article"], []).append(file_path)
+        index.setdefault(normalize_article(info["article"]), []).append(file_path)
     return index
 
 
@@ -281,7 +283,7 @@ def _load_store_state(connection: sqlite3.Connection, store_name: str):
     ]
     files = {
         path: {
-            "article": article,
+            "article": normalize_article(article),
             "mtime_ns": mtime_ns,
             "size": size,
             "priority": priority,
@@ -345,10 +347,13 @@ def get_index_for_store(store_name: str) -> dict:
     if rows or has_state:
         index = {}
         for article, path in rows:
-            index.setdefault(article, []).append(path)
+            index.setdefault(normalize_article(article), []).append(path)
     else:
         # Совместимость до первой SQLite-синхронизации.
-        index = _load_legacy_index(store_name)
+        legacy_index = _load_legacy_index(store_name)
+        index = {}
+        for article, paths in legacy_index.items():
+            index.setdefault(normalize_article(article), []).extend(paths)
 
     INDEX_CACHE[store_name] = index
     return index
@@ -581,6 +586,7 @@ def update_yandex_index_for_store(
             # снимок папки в памяти больше не строится.
             continue
         article, extension = os.path.splitext(resource.name)
+        article = normalize_article(article)
         if extension.lower() not in _SUPPORTED_EXTENSIONS:
             continue
         current_files[resource_uri] = {

@@ -2,6 +2,7 @@ import os
 import json
 import tempfile
 import unittest
+import unicodedata
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -21,10 +22,12 @@ from gui.main_window import (
 )
 from matcher import (
     AlekseevMatcher,
+    KristabellMatcher,
     SimpleMatcher,
     get_matcher_options,
     resolve_matcher_name,
 )
+from indexer import _index_from_files
 from core.personalization import (
     normalise_store_suffix_exclusions,
     should_append_store_suffix,
@@ -223,6 +226,122 @@ class ManualOverrideBatchTests(unittest.TestCase):
                 overrides_module.invalidate_cache()
 
 class MatcherExtensionFilterTests(unittest.TestCase):
+    def test_cyrillic_short_i_matches_both_unicode_forms(self):
+        composed = "МАЙКА"
+        decomposed = unicodedata.normalize("NFD", composed)
+        self.assertNotEqual(composed, decomposed)
+        index = _index_from_files({
+            "/prints/decomposed.png": {
+                "article": decomposed,
+                "priority": 1,
+            }
+        })
+        with patch("matcher.get_index_for_store", return_value=index), patch(
+            "matcher.get_override", return_value=None
+        ):
+            result = SimpleMatcher().find_file_by_article_and_size(
+                composed, "", "Shop_WB"
+            )
+        self.assertEqual(result, ["/prints/decomposed.png"])
+
+    def test_existing_sqlite_index_with_decomposed_short_i_is_read_normally(self):
+        import indexer as indexer_module
+
+        composed = "МАЙКА"
+        decomposed = unicodedata.normalize("NFD", composed)
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "indexes.sqlite3")
+            with patch.object(indexer_module, "_get_db_path", return_value=database):
+                with indexer_module._connect() as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO store_state(store, schema_version, last_scan_ns)
+                        VALUES (?, ?, ?)
+                        """,
+                        ("Shop_WB", 2, 1),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO files(store, path, article, mtime_ns, size, priority)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        ("Shop_WB", "/prints/майка.png", decomposed, 1, 1, 1),
+                    )
+                indexer_module.INDEX_CACHE.pop("Shop_WB", None)
+                index = indexer_module.get_index_for_store("Shop_WB")
+                self.assertEqual(index[composed], ["/prints/майка.png"])
+                indexer_module.INDEX_CACHE.pop("Shop_WB", None)
+
+
+class KristabellMatcherRangeTests(unittest.TestCase):
+    def _find(self, article, size, index):
+        with patch("matcher.get_index_for_store", return_value=index), patch(
+            "matcher.get_override", return_value=None
+        ):
+            return KristabellMatcher().find_file_by_article_and_size(
+                article, size, "KRISTABELL_WB"
+            )
+
+    def test_small_size_prefers_narrow_range(self):
+        index = {
+            "ART (XS_XL)": ["/prints/narrow-small.png"],
+            "ART (XS_6XL)": ["/prints/combined.png"],
+        }
+        self.assertEqual(
+            self._find("ART", "S", index),
+            ["/prints/narrow-small.png"],
+        )
+
+    def test_small_size_falls_back_to_combined_range(self):
+        index = {"ART (XS_6XL)": ["/prints/combined.png"]}
+        self.assertEqual(
+            self._find("ART", "S", index),
+            ["/prints/combined.png"],
+        )
+
+    def test_large_size_prefers_narrow_range(self):
+        index = {
+            "ART (2XL_6XL)": ["/prints/narrow-large.png"],
+            "ART (XS_6XL)": ["/prints/combined.png"],
+        }
+        self.assertEqual(
+            self._find("ART", "4XL", index),
+            ["/prints/narrow-large.png"],
+        )
+
+    def test_large_size_falls_back_to_combined_range(self):
+        index = {"ART (XS_6XL)": ["/prints/combined.png"]}
+        self.assertEqual(
+            self._find("ART", "4XL", index),
+            ["/prints/combined.png"],
+        )
+
+    def test_unknown_size_keeps_plain_article_behavior(self):
+        index = {
+            "ART": ["/prints/plain.png"],
+            "ART (XS_6XL)": ["/prints/combined.png"],
+        }
+        self.assertEqual(
+            self._find("ART", "7XL", index),
+            ["/prints/plain.png"],
+        )
+
+    def test_combined_range_supports_cyrillic_short_i_unicode_forms(self):
+        composed = "МАЙКА"
+        decomposed_key = unicodedata.normalize("NFD", f"{composed} (XS_6XL)")
+        index = _index_from_files({
+            "/prints/майка.png": {
+                "article": decomposed_key,
+                "priority": 1,
+            }
+        })
+        self.assertEqual(
+            self._find(composed, "M", index),
+            ["/prints/майка.png"],
+        )
+
+
+class MatcherExtensionBehaviorTests(unittest.TestCase):
     def test_png_filter_is_case_insensitive_and_filters_before_selection(self):
         index = {"A": [r"C:\prints\A.pdf", r"C:\prints\A.PNG", r"C:\prints\A.png"]}
         with patch("matcher.get_index_for_store", return_value=index), patch(

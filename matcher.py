@@ -5,6 +5,7 @@ from manual_overrides import get_override
 from indexer import get_index_for_store
 from core.paths import resource_path
 from core.yandex_disk import is_yandex_uri
+from core.text_normalization import normalize_article
 
 CONFIG_PATH = resource_path("config_matcher.yaml")
 _config_cache = None
@@ -38,6 +39,7 @@ class BaseMatcher:
 
     def find_file_by_article(self, article, store_name):
         index = get_index_for_store(store_name)
+        article = normalize_article(article)
         if article in index:
             return index[article]
         return []
@@ -58,6 +60,7 @@ class BaseMatcher:
         self, article, size_from_pdf, store_name, search_func,
         allowed_extensions=None,
     ):
+        article = normalize_article(article)
         matches = search_func(article, size_from_pdf, store_name)
         if allowed_extensions is not None:
             normalised_extensions = {
@@ -176,6 +179,10 @@ class KristabellMatcher(BaseMatcher):
 
             if search_key in index:
                 return index[search_key]
+
+            combined_range_key = f"{clean_article} (XS_6XL)"
+            if combined_range_key in index:
+                return index[combined_range_key]
             return []
 
         return self.find_with_override(

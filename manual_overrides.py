@@ -2,6 +2,7 @@ import json
 import os
 
 from core.paths import get_data_path
+from core.text_normalization import normalize_article
 from core.json_storage import atomic_write_json
 
 OVERRIDES_FILE = get_data_path("manual_overrides.json")
@@ -45,7 +46,7 @@ def _build_key(store_name, supply_type):
     return f"{store_name}_{supply_type}"
 
 def _build_sub_key(article, size):
-    return f"{article}_{size}".strip("_")
+    return f"{normalize_article(article)}_{size}".strip("_")
 
 def get_override(store_name, supply_type, article, size):
     overrides = _load_to_cache()

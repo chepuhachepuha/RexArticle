@@ -21,10 +21,12 @@ KNOWN_SIZES = {
 _SIZE_PATTERN = "|".join(
     re.escape(size) for size in sorted(KNOWN_SIZES, key=len, reverse=True)
 )
+_GROUPED_SIZE_PATTERN = rf"(?:{_SIZE_PATTERN})\s*\(\s*(?:{_SIZE_PATTERN})\s*\)"
+_SIZE_VALUE_PATTERN = rf"(?:{_GROUPED_SIZE_PATTERN}|{_SIZE_PATTERN})"
 _TRAILING_SIZE_PATTERNS = (
-    re.compile(rf"^(?P<article>.+?)\s*,\s*(?P<size>{_SIZE_PATTERN})\s*$", re.IGNORECASE),
-    re.compile(rf"^(?P<article>.+?)\s*-\s*(?P<size>{_SIZE_PATTERN})\s*$", re.IGNORECASE),
-    re.compile(rf"^(?P<article>.+?)\s+(?P<size>{_SIZE_PATTERN})\s*$", re.IGNORECASE),
+    re.compile(rf"^(?P<article>.+?)\s*,\s*(?P<size>{_SIZE_VALUE_PATTERN})\s*$", re.IGNORECASE),
+    re.compile(rf"^(?P<article>.+?)\s*-\s*(?P<size>{_SIZE_VALUE_PATTERN})\s*$", re.IGNORECASE),
+    re.compile(rf"^(?P<article>.+?)\s+(?P<size>{_SIZE_VALUE_PATTERN})\s*$", re.IGNORECASE),
 )
 
 
@@ -85,7 +87,7 @@ def parse_article_and_size(variant_size: str) -> Tuple[str, str]:
         match = pattern.match(normalized)
         if match:
             article = match.group("article").strip()
-            size = match.group("size").upper()
+            size = re.sub(r"\s+", "", match.group("size")).upper()
             if article:
                 return article, size
 

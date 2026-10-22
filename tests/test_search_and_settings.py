@@ -41,6 +41,22 @@ class OzonParserTests(unittest.TestCase):
         self.assertEqual(parse_article_and_size("ART XL"), ("ART", "XL"))
         self.assertEqual(parse_article_and_size("ART, 2xl"), ("ART", "2XL"))
 
+    def test_grouped_sizes_are_split_and_normalised(self):
+        self.assertEqual(
+            parse_article_and_size("Лонг Ellesse 5, XS(M)"),
+            ("Лонг Ellesse 5", "XS(M)"),
+        )
+        self.assertEqual(
+            parse_article_and_size("Лонг Margiela 6,\nXL ( 3xl )"),
+            ("Лонг Margiela 6", "XL(3XL)"),
+        )
+
+    def test_unknown_grouped_size_remains_part_of_article(self):
+        self.assertEqual(
+            parse_article_and_size("ART, CUSTOM(XL)"),
+            ("ART, CUSTOM(XL)", "0"),
+        )
+
     def test_missing_or_unknown_size_uses_zero(self):
         self.assertEqual(parse_article_and_size("S_m_autumn_w_002"), ("S_m_autumn_w_002", "0"))
         self.assertEqual(parse_article_and_size("ART, 42"), ("ART, 42", "0"))

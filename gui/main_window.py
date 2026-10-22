@@ -434,6 +434,7 @@ class SearchWorker(QRunnable):
             matches = matcher.find_file_by_article_and_size(
                 article, size, index_store_name,
                 allowed_extensions=allowed_extensions,
+                size_ranges=type_data.get("size_ranges", []),
             )
 
             if matches:

@@ -18,7 +18,7 @@ DB_FILENAME = "indexes.sqlite3"
 INDEX_CACHE = {}
 
 _SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".pdf", ".tiff", ".tif", ".bmp", ".webp"}
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _NETWORK_SCAN_RETRIES = 4
 
 
@@ -88,6 +88,35 @@ def _connect() -> sqlite3.Connection:
             "ALTER TABLE store_state ADD COLUMN last_scan_ns INTEGER NOT NULL DEFAULT 0"
         )
         connection.commit()
+    legacy_stores = [
+        row[0] for row in connection.execute(
+            "SELECT store FROM store_state WHERE schema_version < ?",
+            (_SCHEMA_VERSION,),
+        )
+    ]
+    if legacy_stores:
+        with connection:
+            for store_name in legacy_stores:
+                rows = connection.execute(
+                    "SELECT path, article FROM files WHERE store = ?",
+                    (store_name,),
+                ).fetchall()
+                connection.executemany(
+                    "UPDATE files SET article = ? WHERE store = ? AND path = ?",
+                    [
+                        (normalize_article(article), store_name, path)
+                        for path, article in rows
+                    ],
+                )
+                connection.execute(
+                    "UPDATE store_state SET schema_version = ? WHERE store = ?",
+                    (_SCHEMA_VERSION, store_name),
+                )
+        INDEX_CACHE.clear()
+        print(
+            f"[INDEX] SQLite обновлён до v{_SCHEMA_VERSION} без сканирования: "
+            f"{len(legacy_stores)} индексов"
+        )
     return connection
 
 

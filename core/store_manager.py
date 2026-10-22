@@ -7,6 +7,31 @@ STORES_FILE = get_data_path("stores.json")
 
 _stores_cache = None
 
+KRISTABELL_SIZE_RANGES = [
+    {"pattern": "(XS_XL)", "sizes": ["XS", "S", "M", "L", "XL"]},
+    {"pattern": "(2XL_6XL)", "sizes": ["2XL", "3XL", "4XL", "5XL", "6XL"]},
+    {"pattern": "(XS_6XL)", "sizes": ["XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "6XL"]},
+]
+
+def _default_type_data():
+    return {
+        "path": "", "matcher": "Simple", "copy_on_override": False,
+        "override_path": "", "source": "local", "png_only": False,
+        "size_ranges": [],
+    }
+
+def _normalise_type_data(type_data):
+    result = _default_type_data()
+    result.update(type_data if isinstance(type_data, dict) else {})
+    if "size_ranges" not in type_data:
+        result["size_ranges"] = (
+            [dict(item, sizes=list(item["sizes"])) for item in KRISTABELL_SIZE_RANGES]
+            if result.get("matcher") == "Kristabell" else []
+        )
+    elif not isinstance(result.get("size_ranges"), list):
+        result["size_ranges"] = []
+    return result
+
 def load_stores():
     global _stores_cache
     if _stores_cache is not None:
@@ -33,45 +58,28 @@ def load_stores():
             needs_migration = True
         elif isinstance(value, dict) and "path" in value:
             needs_migration = True
+        elif isinstance(value, dict):
+            for type_data in value.values():
+                if isinstance(type_data, dict) and "size_ranges" not in type_data:
+                    needs_migration = True
 
     if needs_migration:
         new_stores = {}
         for store_name, value in stores.items():
             if isinstance(value, str):
                 new_stores[store_name] = {
-                    "WB": {
-                        "path": value,
-                        "matcher": "Simple",
-                        "copy_on_override": False,
-                        "override_path": "",
-                        "source": "local",
-                        "png_only": False,
-                    }
+                    "WB": dict(_default_type_data(), path=value)
                 }
             elif isinstance(value, dict) and "path" in value:
                 supply_type = value.get("type", "WB")
                 new_stores[store_name] = {
-                    supply_type: {
-                        "path": value["path"],
-                        "matcher": "Simple",
-                        "copy_on_override": False,
-                        "override_path": "",
-                        "source": "local",
-                        "png_only": False,
-                    }
+                    supply_type: dict(_default_type_data(), path=value["path"])
                 }
             else:
                 migrated_store = {}
                 for supply_type, type_data in value.items():
                     if isinstance(type_data, dict):
-                        migrated_store[supply_type] = {
-                            "path": type_data.get("path", ""),
-                            "matcher": type_data.get("matcher", "Simple"),
-                            "copy_on_override": type_data.get("copy_on_override", False),
-                            "override_path": type_data.get("override_path", ""),
-                            "source": type_data.get("source", "local"),
-                            "png_only": bool(type_data.get("png_only", False)),
-                        }
+                        migrated_store[supply_type] = _normalise_type_data(type_data)
                 if migrated_store:
                     new_stores[store_name] = migrated_store
                 else:
@@ -101,14 +109,7 @@ def add_store(store_name):
     if store_name in stores:
         return False
     stores[store_name] = {
-        "WB": {
-            "path": "",
-            "matcher": "Simple",
-            "copy_on_override": False,
-            "override_path": "",
-            "source": "local",
-            "png_only": False,
-        }
+        "WB": _default_type_data()
     }
     save_stores(stores)
     return True
@@ -125,14 +126,7 @@ def add_type(store_name, supply_type):
     stores = load_stores()
     if store_name not in stores:
         stores[store_name] = {}
-    stores[store_name][supply_type] = {
-        "path": "",
-        "matcher": "Simple",
-        "copy_on_override": False,
-        "override_path": "",
-        "source": "local",
-        "png_only": False,
-    }
+    stores[store_name][supply_type] = _default_type_data()
     save_stores(stores)
 
 def remove_type(store_name, supply_type):

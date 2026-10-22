@@ -2,6 +2,8 @@ import os
 import json
 import time
 import sys
+import re
+from copy import deepcopy
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QWidget, QFrame, QLineEdit,
@@ -31,8 +33,137 @@ from core.yandex_disk import (
 )
 from gui.dialogs.yandex_disk_picker import YandexDiskPickerDialog
 from matcher import get_matcher_options, resolve_matcher_name
+from core.text_normalization import normalize_article
 
 OVERRIDES_FILE = get_data_path("manual_overrides.json")
+
+
+def _parse_range_sizes(text):
+    result = []
+    seen = set()
+    for value in re.split(r"[,;\n]+", text):
+        value = value.strip()
+        key = normalize_article(value)
+        if key and key not in seen:
+            seen.add(key)
+            result.append(value.upper())
+    return result
+
+
+class SizeRangeEditDialog(QDialog):
+    def __init__(self, parent=None, item=None):
+        super().__init__(parent)
+        self.setWindowTitle("Диапазон размеров")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Паттерн в конце имени файла:"))
+        self.pattern = QLineEdit((item or {}).get("pattern", ""))
+        layout.addWidget(self.pattern)
+        layout.addWidget(QLabel("Размеры через запятую, точку с запятой или новую строку:"))
+        self.sizes = QTextEdit()
+        self.sizes.setPlainText(", ".join((item or {}).get("sizes", [])))
+        self.sizes.setFixedHeight(90)
+        layout.addWidget(self.sizes)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _accept(self):
+        if not normalize_article(self.pattern.text()):
+            QMessageBox.warning(self, "Ошибка", "Паттерн не может быть пустым.")
+            return
+        if not _parse_range_sizes(self.sizes.toPlainText()):
+            QMessageBox.warning(self, "Ошибка", "Укажите хотя бы один размер.")
+            return
+        self.accept()
+
+    def value(self):
+        return {
+            "pattern": self.pattern.text(),
+            "sizes": _parse_range_sizes(self.sizes.toPlainText()),
+        }
+
+
+class SizeRangesDialog(QDialog):
+    def __init__(self, ranges, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Диапазоны размеров")
+        self.resize(620, 360)
+        self.ranges = deepcopy(ranges or [])
+        layout = QVBoxLayout(self)
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Паттерн", "Размеры"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        layout.addWidget(self.table)
+        actions = QHBoxLayout()
+        for text_value, callback in (
+            ("Добавить", self._add), ("Изменить", self._edit),
+            ("Удалить", self._delete), ("↑", lambda: self._move(-1)),
+            ("↓", lambda: self._move(1)),
+        ):
+            button = QPushButton(text_value)
+            button.clicked.connect(callback)
+            actions.addWidget(button)
+        actions.addStretch()
+        layout.addLayout(actions)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._refresh()
+
+    def _refresh(self, selected=None):
+        self.table.setRowCount(len(self.ranges))
+        for row, item in enumerate(self.ranges):
+            self.table.setItem(row, 0, QTableWidgetItem(item["pattern"]))
+            self.table.setItem(row, 1, QTableWidgetItem(", ".join(item["sizes"])))
+        if selected is not None and self.ranges:
+            self.table.selectRow(max(0, min(selected, len(self.ranges) - 1)))
+
+    def _current_row(self):
+        return self.table.currentRow()
+
+    def _validate_pattern(self, item, skip=-1):
+        key = normalize_article(item["pattern"])
+        return all(i == skip or normalize_article(value["pattern"]) != key for i, value in enumerate(self.ranges))
+
+    def _add(self):
+        dialog = SizeRangeEditDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            item = dialog.value()
+            if not self._validate_pattern(item):
+                QMessageBox.warning(self, "Ошибка", "Такой паттерн уже существует.")
+                return
+            self.ranges.append(item)
+            self._refresh(len(self.ranges) - 1)
+
+    def _edit(self):
+        row = self._current_row()
+        if row < 0:
+            return
+        dialog = SizeRangeEditDialog(self, self.ranges[row])
+        if dialog.exec() == QDialog.Accepted:
+            item = dialog.value()
+            if not self._validate_pattern(item, row):
+                QMessageBox.warning(self, "Ошибка", "Такой паттерн уже существует.")
+                return
+            self.ranges[row] = item
+            self._refresh(row)
+
+    def _delete(self):
+        row = self._current_row()
+        if row >= 0:
+            del self.ranges[row]
+            self._refresh(row)
+
+    def _move(self, offset):
+        row = self._current_row()
+        target = row + offset
+        if row < 0 or target < 0 or target >= len(self.ranges):
+            return
+        self.ranges[row], self.ranges[target] = self.ranges[target], self.ranges[row]
+        self._refresh(target)
 
 
 class SettingsIndexSignals(QObject):
@@ -960,6 +1091,7 @@ class SettingsWindow(QDialog):
             "override_path": "",
             "source": "local",
             "png_only": False,
+            "size_ranges": [],
         }
         self.stores[store_name][supply_type] = values.copy()
         self.type_vars.setdefault(store_name, {})[supply_type] = values.copy()
@@ -980,6 +1112,7 @@ class SettingsWindow(QDialog):
                 "override_path": type_data.get("override_path", ""),
                 "source": type_data.get("source", "local"),
                 "png_only": bool(type_data.get("png_only", False)),
+                "size_ranges": deepcopy(type_data.get("size_ranges", [])),
             }
 
         vars_dict = self.type_vars[store_name][supply_type]
@@ -1079,6 +1212,19 @@ class SettingsWindow(QDialog):
         )
         matcher_layout.addWidget(matcher_combo, 1)
         group_layout.addLayout(matcher_layout)
+
+        ranges_layout = QHBoxLayout()
+        ranges_label = QLabel("Размерные файлы:")
+        ranges_label.setFixedWidth(120)
+        ranges_layout.addWidget(ranges_label)
+        ranges_button = QPushButton(
+            f"Диапазоны размеров… ({len(vars_dict.get('size_ranges', []))})"
+        )
+        ranges_button.clicked.connect(
+            lambda _checked=False, st=supply_type: self._edit_size_ranges(st)
+        )
+        ranges_layout.addWidget(ranges_button, 1)
+        group_layout.addLayout(ranges_layout)
 
         # Папка
         folder_layout = QHBoxLayout()
@@ -1245,6 +1391,18 @@ class SettingsWindow(QDialog):
             self.needs_reset_cache = True
             self._auto_save()
 
+    def _edit_size_ranges(self, supply_type):
+        store_name = self.selected_store
+        vars_dict = self.type_vars.get(store_name, {}).get(supply_type)
+        if vars_dict is None:
+            return
+        dialog = SizeRangesDialog(vars_dict.get("size_ranges", []), self)
+        if dialog.exec() == QDialog.Accepted:
+            vars_dict["size_ranges"] = deepcopy(dialog.ranges)
+            self.needs_reset_cache = True
+            self._auto_save()
+            self.refresh_types_for_store(store_name)
+
     def _on_png_only_toggled(self, supply_type, checked):
         store_name = self.selected_store
         if store_name in self.type_vars and supply_type in self.type_vars[store_name]:
@@ -1289,6 +1447,7 @@ class SettingsWindow(QDialog):
                     "override_path": vars_dict["override_path"].strip(),
                     "source": vars_dict.get("source", "local"),
                     "png_only": bool(vars_dict.get("png_only", False)),
+                    "size_ranges": deepcopy(vars_dict.get("size_ranges", [])),
                 }
 
         for supply_type in set(list(old_store_data.keys()) + list(new_store_data.keys())):

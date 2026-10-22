@@ -384,6 +384,8 @@ class NewStoreDialog(QDialog):
             "copy_on_override": False,
             "override_path": "",
             "source": source,
+            "png_only": False,
+            "size_ranges": [],
         }
 
         save_stores(stores)

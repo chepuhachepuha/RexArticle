@@ -28,10 +28,53 @@ from matcher import (
     resolve_matcher_name,
 )
 from indexer import _index_from_files
+from ozon_parser import parse_article_and_size, parse_ozon_supply
 from core.personalization import (
     normalise_store_suffix_exclusions,
     should_append_store_suffix,
 )
+
+
+class OzonParserTests(unittest.TestCase):
+    def test_supported_size_separators(self):
+        self.assertEqual(parse_article_and_size("ART-XL"), ("ART", "XL"))
+        self.assertEqual(parse_article_and_size("ART XL"), ("ART", "XL"))
+        self.assertEqual(parse_article_and_size("ART, 2xl"), ("ART", "2XL"))
+
+    def test_missing_or_unknown_size_uses_zero(self):
+        self.assertEqual(parse_article_and_size("S_m_autumn_w_002"), ("S_m_autumn_w_002", "0"))
+        self.assertEqual(parse_article_and_size("ART, 42"), ("ART, 42", "0"))
+
+    def test_wrapped_code_article_is_reassembled_before_parsing(self):
+        self.assertEqual(
+            parse_article_and_size("s_n_harrypotter_w_1\n7,0"),
+            ("s_n_harrypotter_w_17", "0"),
+        )
+
+    def test_regular_multiline_article_keeps_word_separator(self):
+        self.assertEqual(
+            parse_article_and_size("Король и Шут черн,\nXS"),
+            ("Король и Шут черн", "XS"),
+        )
+
+    def test_empty_value_has_zero_size(self):
+        self.assertEqual(parse_article_and_size(""), ("", "0"))
+
+    def test_article_is_kept_when_product_name_is_empty(self):
+        page = Mock()
+        page.extract_tables.return_value = [[['', 'ART-XL']]]
+        pdf = Mock()
+        pdf.pages = [page]
+        pdf.__enter__ = Mock(return_value=pdf)
+        pdf.__exit__ = Mock(return_value=False)
+
+        with patch("ozon_parser.mark_ozon_pdf_in_memory", return_value=b"pdf"), patch(
+            "ozon_parser.pdfplumber.open", return_value=pdf
+        ):
+            self.assertEqual(
+                parse_ozon_supply("supply.pdf"),
+                (["ART"], ["XL"], [""]),
+            )
 
 
 class NotFoundFileTests(unittest.TestCase):
@@ -269,7 +312,7 @@ class MatcherExtensionFilterTests(unittest.TestCase):
                     )
                 indexer_module.INDEX_CACHE.pop("Shop_WB", None)
                 index = indexer_module.get_index_for_store("Shop_WB")
-                self.assertEqual(index[composed], ["/prints/майка.png"])
+                self.assertEqual(index["майка"], ["/prints/майка.png"])
                 indexer_module.INDEX_CACHE.pop("Shop_WB", None)
 
 
@@ -339,6 +382,50 @@ class KristabellMatcherRangeTests(unittest.TestCase):
             self._find(composed, "M", index),
             ["/prints/майка.png"],
         )
+
+
+class NormalizedArticleAndCustomRangeTests(unittest.TestCase):
+    def test_article_keys_ignore_case_spaces_and_unicode_form(self):
+        composed = "Й АРТ 123"
+        decomposed = unicodedata.normalize("NFD", composed.lower().replace(" ", ""))
+        index = {decomposed: ["/prints/source.png"]}
+        with patch("matcher.get_index_for_store", return_value=index), patch(
+            "matcher.get_override", return_value=None
+        ):
+            result = SimpleMatcher().find_file_by_article_and_size(
+                composed, "", "Shop_WB"
+            )
+        self.assertEqual(result, ["/prints/source.png"])
+
+    def test_overlapping_ranges_follow_order_then_fallback(self):
+        ranges = [
+            {"pattern": "(FIRST)", "sizes": [" S "]},
+            {"pattern": "(SECOND)", "sizes": ["s"]},
+        ]
+        index = {
+            "art(second)": ["/prints/second.png"],
+            "art": ["/prints/plain.png"],
+        }
+        with patch("matcher.get_index_for_store", return_value=index), patch(
+            "matcher.get_override", return_value=None
+        ):
+            result = SimpleMatcher().find_file_by_article_and_size(
+                "ART", "S", "Shop_WB", size_ranges=ranges
+            )
+        self.assertEqual(result, ["/prints/second.png"])
+
+    def test_explicit_empty_ranges_disables_kristabell_defaults(self):
+        index = {
+            "art(xs_xl)": ["/prints/range.png"],
+            "art": ["/prints/plain.png"],
+        }
+        with patch("matcher.get_index_for_store", return_value=index), patch(
+            "matcher.get_override", return_value=None
+        ):
+            result = KristabellMatcher().find_file_by_article_and_size(
+                "ART", "S", "Shop_WB", size_ranges=[]
+            )
+        self.assertEqual(result, ["/prints/plain.png"])
 
 
 class MatcherExtensionBehaviorTests(unittest.TestCase):

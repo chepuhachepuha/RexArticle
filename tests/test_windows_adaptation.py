@@ -182,8 +182,8 @@ class FilenameCaseTests(unittest.TestCase):
             stored_path = next(iter(files))
             self.assertEqual(Path(stored_path).name, "MiXeD Print.PNG")
             index = _index_from_files(files)
-            self.assertIn("MiXeD Print", index)
-            self.assertEqual(Path(index["MiXeD Print"][0]).name, "MiXeD Print.PNG")
+            self.assertIn("mixedprint", index)
+            self.assertEqual(Path(index["mixedprint"][0]).name, "MiXeD Print.PNG")
 
     def test_result_filename_keeps_source_case(self):
         from gui.main_window import _result_file_base_name

@@ -1,6 +1,7 @@
 from PySide6.QtWidgets import QTreeView, QAbstractItemView, QHeaderView
 from PySide6.QtCore import Qt, QAbstractItemModel, QModelIndex, QSize
 from PySide6.QtGui import QFont, QColor
+from core.text_normalization import normalize_article
 
 
 class SupplyItem:
@@ -82,9 +83,10 @@ class SupplyDeliveryItem(SupplyItem):
 class SupplyArticleItem(SupplyItem):
     """Элемент артикула (child-строка)."""
 
-    def __init__(self, article, size, location, status, parent):
+    def __init__(self, article, size, location, status, parent, detected_article=None):
         super().__init__(parent)
         self.article = article
+        self.detected_article = detected_article if detected_article is not None else article
         self.size = size
         self.location = location
         self.status = status
@@ -226,7 +228,7 @@ class SupplyTreeModel(QAbstractItemModel):
         self.endInsertRows()
         return delivery_item
 
-    def add_articles(self, delivery_item, articles, sizes, locations):
+    def add_articles(self, delivery_item, articles, sizes, locations, article_transform=None):
         """Добавляет артикулы к поставке."""
         delivery_index = self.createIndex(delivery_item.row(), 0, delivery_item)
         count = len(articles)
@@ -234,14 +236,18 @@ class SupplyTreeModel(QAbstractItemModel):
             return
 
         self.beginInsertRows(delivery_index, 0, count - 1)
+        factual_articles = []
         for article, size, location in zip(articles, sizes, locations):
+            factual_article = article_transform(article) if article_transform else article
             article_item = SupplyArticleItem(
-                article, size, location, "Ожидание", delivery_item
+                factual_article, size, location, "Ожидание", delivery_item,
+                detected_article=article,
             )
             delivery_item.append_child(article_item)
+            factual_articles.append(factual_article)
         self.endInsertRows()
 
-        delivery_item.articles = articles
+        delivery_item.articles = factual_articles
         delivery_item.sizes = sizes
         delivery_item.locations = locations
         delivery_item.status = "Ожидание"
@@ -251,6 +257,26 @@ class SupplyTreeModel(QAbstractItemModel):
             delivery_item.row(), self.columnCount() - 1, delivery_item
         )
         self.dataChanged.emit(delivery_index, last_col_index)
+
+    def update_articles_by_detected_article(
+        self, delivery_item, detected_article, factual_article
+    ):
+        """Apply a correction to every matching raw article in one delivery."""
+        target = normalize_article(detected_article)
+        changed_rows = []
+        for row in range(delivery_item.child_count()):
+            item = delivery_item.child(row)
+            if normalize_article(item.detected_article) != target:
+                continue
+            item.article = factual_article
+            changed_rows.append(row)
+            if row < len(delivery_item.articles):
+                delivery_item.articles[row] = factual_article
+
+        for row in changed_rows:
+            index = self.createIndex(row, 0, delivery_item.child(row))
+            self.dataChanged.emit(index, index)
+        return changed_rows
 
     def update_delivery_status(self, delivery_item, status):
         """Обновляет статус поставки."""

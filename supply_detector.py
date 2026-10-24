@@ -3,9 +3,25 @@
 Читает ТОЛЬКО первую страницу PDF для мгновенного результата.
 """
 import fitz
+import re
 
 # Кэш первых страниц PDF
 _first_page_cache = {}
+
+
+def is_ozon_task_format_lines(lines: list) -> bool:
+    """Return whether a page belongs to Ozon's task-list table format."""
+    normalized = {str(line).strip().casefold() for line in lines if str(line).strip()}
+    return {
+        "товар", "артикул", "характеристики",
+    }.issubset(normalized) and any("магазин" in line for line in normalized)
+
+
+def extract_ozon_task_store_name(lines: list) -> str:
+    """Read the store name from ``Магазин «…»`` in an Ozon task header."""
+    text = " ".join(str(line).strip() for line in lines)
+    match = re.search(r'Магазин\s*[«"]\s*([^»"]+?)\s*[»"]', text, re.IGNORECASE)
+    return match.group(1).strip() if match else "UNKNOWN"
 
 
 def get_first_page_lines(pdf_path: str) -> list:
@@ -49,6 +65,14 @@ def detect_supply_type(pdf_path: str) -> dict:
         if not lines:
             return {"store_name": "UNKNOWN", "supply_type": "UNKNOWN"}
         
+        # Новый Ozon-формат содержит полноценные заголовки таблицы и магазин
+        # в строке задания. Проверяем его до общего правила для Ozon.
+        if is_ozon_task_format_lines(lines):
+            return {
+                "store_name": extract_ozon_task_store_name(lines),
+                "supply_type": "OZON",
+            }
+
         # Определяем тип поставки
         has_wb = any("WB" in line.upper() for line in lines[:50])
         

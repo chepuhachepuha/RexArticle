@@ -7,7 +7,7 @@ import re
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QToolBar, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QToolButton, QFrame, QLabel, QFileDialog, QMessageBox, QSizePolicy,
-    QDialog, QProgressDialog,
+    QDialog, QProgressDialog, QLineEdit, QDialogButtonBox,
 )
 from PySide6.QtCore import (
     Qt, QDateTime, QTime, QUrl, QRunnable, QThreadPool, Signal, QObject, Slot,
@@ -21,7 +21,9 @@ from core.personalization import (
     normalise_store_suffix_exclusions,
     should_append_store_suffix,
 )
-from gui.widgets.supply_tree import SupplyTreeView, SupplyTreeModel, SupplyDeliveryItem
+from gui.widgets.supply_tree import (
+    SupplyTreeView, SupplyTreeModel, SupplyDeliveryItem, SupplyArticleItem,
+)
 from gui.widgets.override_delegate import OverrideButtonDelegate
 from gui.dialogs.parse_progress_dialog import ParseProgressDialog
 from gui.dialogs.yandex_disk_picker import YandexDiskPickerDialog
@@ -37,6 +39,7 @@ from indexer import (
 )
 from matcher import get_matcher_for_store
 from manual_overrides import get_override, set_override, set_overrides
+from article_corrections import get_corrected_article, set_article_correction
 
 
 # ============================================
@@ -194,6 +197,42 @@ class CancellationFlag(CancellationToken):
 
     def is_canceled(self):
         return self.is_cancelled()
+
+
+class ArticleCorrectionDialog(QDialog):
+    """Edit the factual article while keeping the parsed value visible."""
+
+    def __init__(self, detected_article, factual_article, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Уточнить артикул")
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+
+        layout.addWidget(QLabel("Артикул, прочитанный программой:"))
+        detected_label = QLabel(str(detected_article))
+        detected_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        detected_label.setWordWrap(True)
+        layout.addWidget(detected_label)
+
+        layout.addWidget(QLabel("Фактический артикул:"))
+        self.article_input = QLineEdit(str(factual_article))
+        self.article_input.selectAll()
+        layout.addWidget(self.article_input)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def factual_article(self):
+        return self.article_input.text().strip()
 
 
 # ============================================
@@ -682,6 +721,10 @@ class MainWindow(QMainWindow):
             return
 
         item = index.internalPointer()
+        if isinstance(item, SupplyArticleItem):
+            if index.column() == 0:
+                self.on_article_clicked(item)
+            return
         if not isinstance(item, SupplyDeliveryItem):
             return
 
@@ -694,6 +737,49 @@ class MainWindow(QMainWindow):
             self.tree_view.collapse(index)
         else:
             self.tree_view.expand(index)
+
+    def on_article_clicked(self, article_item):
+        """Persist and apply a factual article correction for one store/type."""
+        if self.is_searching:
+            QMessageBox.information(
+                self, "Поиск выполняется",
+                "Дождитесь завершения поиска перед уточнением артикула.",
+            )
+            return
+
+        delivery_item = article_item.parent()
+        dialog = ArticleCorrectionDialog(
+            article_item.detected_article, article_item.article, self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        factual_article = dialog.factual_article()
+        if not factual_article:
+            QMessageBox.warning(
+                self, "Пустой артикул", "Введите фактический артикул.",
+            )
+            return
+
+        try:
+            factual_article = set_article_correction(
+                delivery_item.store_name,
+                delivery_item.supply_type,
+                article_item.detected_article,
+                factual_article,
+            )
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(
+                self, "Ошибка сохранения", f"Не удалось сохранить уточнение: {error}",
+            )
+            return
+
+        changed_rows = self.tree_model.update_articles_by_detected_article(
+            delivery_item, article_item.detected_article, factual_article
+        )
+        for row in changed_rows:
+            self.tree_model.update_article_status(delivery_item, row, "Ожидание")
+            delivery_item.child(row).copied_file = None
 
     def setup_toolbar(self):
         toolbar = QToolBar()
@@ -904,7 +990,15 @@ class MainWindow(QMainWindow):
         if not articles:
             self.tree_model.update_delivery_status(delivery_item, "Пусто")
         else:
-            self.tree_model.add_articles(delivery_item, articles, sizes, locations)
+            self.tree_model.add_articles(
+                delivery_item,
+                articles,
+                sizes,
+                locations,
+                article_transform=lambda article: get_corrected_article(
+                    delivery_item.store_name, delivery_item.supply_type, article
+                ),
+            )
             self.tree_model.update_delivery_status(delivery_item, "Ожидание")
             delivery_index = self.tree_model.index(delivery_item.row(), 0)
             self.tree_view.setExpanded(
@@ -1012,8 +1106,9 @@ class MainWindow(QMainWindow):
         store_name = delivery_item.store_name
         supply_type = delivery_item.supply_type
 
-        # Артикул сразу доступен для вставки в поиск Finder/Проводника.
+        # Синхронизируем буфер с нативным окном выбора файла до его открытия.
         QApplication.clipboard().setText(article)
+        QApplication.processEvents()
         type_data = get_type_data(store_name, supply_type)
         if type_data.get("source") == "yandex":
             if sys.platform.startswith("win"):

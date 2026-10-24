@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QFileDialog, QMessageBox, QGroupBox,
     QInputDialog, QSplitter, QTextEdit, QApplication, QProgressBar, QComboBox,
     QTabWidget, QTimeEdit, QTableWidget, QTableWidgetItem, QDialogButtonBox,
-    QHeaderView
+    QHeaderView, QListWidget
 )
 from PySide6.QtCore import (
     Qt, QTime, QTimer, QObject, QRunnable, QThreadPool, Signal, Slot, QUrl,
@@ -34,6 +34,10 @@ from core.yandex_disk import (
 from gui.dialogs.yandex_disk_picker import YandexDiskPickerDialog
 from matcher import get_matcher_options, resolve_matcher_name
 from core.text_normalization import normalize_article
+from core.ozon_sizes import (
+    COMMON_GROUPED_SIZES, CONFIG_KEY as OZON_SIZES_CONFIG_KEY,
+    STANDARD_SIZES, clean_custom_sizes, validate_custom_size,
+)
 
 OVERRIDES_FILE = get_data_path("manual_overrides.json")
 
@@ -396,6 +400,9 @@ class SettingsWindow(QDialog):
         self.stores = load_stores()
         self.config_file = get_data_path("config.json")
         self.app_config = self._load_app_config()
+        self.ozon_custom_sizes = clean_custom_sizes(
+            self.app_config.get(OZON_SIZES_CONFIG_KEY, [])
+        )
         self.store_display_names = dict(
             self.app_config.get("store_display_names", {}) or {}
         )
@@ -623,11 +630,143 @@ class SettingsWindow(QDialog):
 
         stores_layout.addWidget(splitter)
         self.tabs.addTab(stores_tab, "Магазины")
+        self.tabs.addTab(self._create_ozon_sizes_tab(), "Словарь размеров Ozon")
         self.tabs.addTab(self._create_personalization_tab(), "Персонализация")
         self.tabs.addTab(self._create_yandex_tab(), "Яндекс Диск")
 
         self.refresh_store_buttons()
         self._clear_inline_styles()
+
+    def _create_ozon_sizes_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(12)
+
+        title = QLabel("Словарь размеров Ozon")
+        title.setObjectName("settingsTitle")
+        layout.addWidget(title)
+        hint = QLabel(
+            "Размеры используются при разборе поставок Ozon. "
+            "Числовые размеры, кроме 0, отделяются только после запятой."
+        )
+        hint.setObjectName("settingsSubtitle")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        columns = QHBoxLayout()
+        columns.setSpacing(12)
+
+        builtins_group = QGroupBox("Готовые размеры")
+        builtins_group.setProperty("settingsCard", True)
+        builtins_layout = QVBoxLayout(builtins_group)
+        builtins_list = QListWidget()
+        builtins_list.addItems([*STANDARD_SIZES, *COMMON_GROUPED_SIZES])
+        builtins_list.setSelectionMode(QListWidget.NoSelection)
+        builtins_layout.addWidget(builtins_list)
+        builtin_hint = QLabel(
+            "Также распознаются другие сочетания стандартных размеров "
+            "в скобках, например S(M)."
+        )
+        builtin_hint.setWordWrap(True)
+        builtins_layout.addWidget(builtin_hint)
+        columns.addWidget(builtins_group, 1)
+
+        custom_group = QGroupBox("Свои размеры")
+        custom_group.setProperty("settingsCard", True)
+        custom_layout = QVBoxLayout(custom_group)
+        self.ozon_custom_sizes_list = QListWidget()
+        self.ozon_custom_sizes_list.addItems(self.ozon_custom_sizes)
+        self.ozon_custom_sizes_list.currentRowChanged.connect(
+            self._update_ozon_size_actions
+        )
+        custom_layout.addWidget(self.ozon_custom_sizes_list)
+
+        add_row = QHBoxLayout()
+        self.ozon_size_input = QLineEdit()
+        self.ozon_size_input.setPlaceholderText("Новый размер")
+        self.ozon_size_input.returnPressed.connect(self._add_ozon_size)
+        add_row.addWidget(self.ozon_size_input, 1)
+        add_button = QPushButton("Добавить")
+        add_button.clicked.connect(self._add_ozon_size)
+        add_row.addWidget(add_button)
+        custom_layout.addLayout(add_row)
+
+        actions = QHBoxLayout()
+        self.ozon_size_edit_button = QPushButton("Изменить")
+        self.ozon_size_edit_button.clicked.connect(self._edit_ozon_size)
+        actions.addWidget(self.ozon_size_edit_button)
+        self.ozon_size_delete_button = QPushButton("Удалить")
+        self.ozon_size_delete_button.setProperty("destructive", True)
+        self.ozon_size_delete_button.clicked.connect(self._delete_ozon_size)
+        actions.addWidget(self.ozon_size_delete_button)
+        actions.addStretch()
+        custom_layout.addLayout(actions)
+        columns.addWidget(custom_group, 1)
+        layout.addLayout(columns, 1)
+        self._update_ozon_size_actions()
+        return tab
+
+    def _update_ozon_size_actions(self, *_):
+        selected = self.ozon_custom_sizes_list.currentRow() >= 0
+        self.ozon_size_edit_button.setEnabled(selected)
+        self.ozon_size_delete_button.setEnabled(selected)
+
+    def _save_ozon_sizes(self, values, selected=None):
+        config = self._load_app_config()
+        config[OZON_SIZES_CONFIG_KEY] = values
+        try:
+            atomic_write_json(self.config_file, config)
+        except OSError as error:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить словарь: {error}")
+            return False
+        self.app_config = config
+        self.ozon_custom_sizes = list(values)
+        self.ozon_custom_sizes_list.clear()
+        self.ozon_custom_sizes_list.addItems(values)
+        if selected is not None and values:
+            self.ozon_custom_sizes_list.setCurrentRow(min(selected, len(values) - 1))
+        self._update_ozon_size_actions()
+        return True
+
+    def _add_ozon_size(self):
+        try:
+            value = validate_custom_size(
+                self.ozon_size_input.text(), self.ozon_custom_sizes
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "Некорректный размер", str(error))
+            return
+        values = [*self.ozon_custom_sizes, value]
+        if self._save_ozon_sizes(values, len(values) - 1):
+            self.ozon_size_input.clear()
+
+    def _edit_ozon_size(self):
+        row = self.ozon_custom_sizes_list.currentRow()
+        if row < 0:
+            return
+        value, accepted = QInputDialog.getText(
+            self, "Изменить размер", "Размер:",
+            QLineEdit.Normal, self.ozon_custom_sizes[row],
+        )
+        if not accepted:
+            return
+        try:
+            value = validate_custom_size(value, self.ozon_custom_sizes, skip=row)
+        except ValueError as error:
+            QMessageBox.warning(self, "Некорректный размер", str(error))
+            return
+        values = list(self.ozon_custom_sizes)
+        values[row] = value
+        self._save_ozon_sizes(values, row)
+
+    def _delete_ozon_size(self):
+        row = self.ozon_custom_sizes_list.currentRow()
+        if row < 0:
+            return
+        values = list(self.ozon_custom_sizes)
+        del values[row]
+        self._save_ozon_sizes(values, row)
 
     def _create_personalization_tab(self):
         tab = QWidget()

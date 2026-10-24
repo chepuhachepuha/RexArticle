@@ -6,7 +6,10 @@ import sys
 
 
 APP_NAME = "RexArticles"
-SETTINGS_FILES = ("config.json", "stores.json", "manual_overrides.json")
+SETTINGS_FILES = (
+    "config.json", "stores.json", "manual_overrides.json",
+    "article_corrections.json",
+)
 
 
 def get_app_dir() -> str:

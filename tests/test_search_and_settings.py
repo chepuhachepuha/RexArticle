@@ -29,13 +29,209 @@ from matcher import (
 )
 from indexer import _index_from_files
 from ozon_parser import parse_article_and_size, parse_ozon_supply
+from core.ozon_sizes import clean_custom_sizes, validate_custom_size
+from supply_detector import detect_supply_type
 from core.personalization import (
     normalise_store_suffix_exclusions,
     should_append_store_suffix,
 )
+import article_corrections
+from gui.widgets.supply_tree import SupplyTreeModel
 
 
 class OzonParserTests(unittest.TestCase):
+    @staticmethod
+    def _pdf_with_tables(tables):
+        page = Mock()
+        page.extract_tables.return_value = tables
+        pdf = Mock()
+        pdf.pages = [page]
+        pdf.__enter__ = Mock(return_value=pdf)
+        pdf.__exit__ = Mock(return_value=False)
+        return pdf
+
+    def test_detects_new_ozon_task_format_and_quoted_store(self):
+        lines = [
+            "Задание EE-SW-1 · Магазин «ANIREX» · 24.10.2026",
+            "№", "Фото", "Товар", "Артикул", "Цвет", "Характеристики", "Кол.",
+        ]
+        with patch("supply_detector.get_first_page_lines", return_value=lines):
+            self.assertEqual(
+                detect_supply_type("task.pdf"),
+                {"store_name": "ANIREX", "supply_type": "OZON"},
+            )
+
+
+class ArticleCorrectionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def tearDown(self):
+        article_corrections.invalidate_cache()
+
+    @staticmethod
+    def _pdf_with_tables(tables):
+        page = Mock()
+        page.extract_tables.return_value = tables
+        pdf = Mock()
+        pdf.pages = [page]
+        pdf.__enter__ = Mock(return_value=pdf)
+        pdf.__exit__ = Mock(return_value=False)
+        return pdf
+
+    def test_correction_persists_by_store_and_type_and_can_be_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "article_corrections.json")
+            with patch.object(article_corrections, "CORRECTIONS_FILE", path):
+                article_corrections.invalidate_cache()
+                self.assertEqual(
+                    article_corrections.set_article_correction(
+                        "Shop", "WB", "АРТ 123", "ФАКТ 456"
+                    ),
+                    "ФАКТ 456",
+                )
+                article_corrections.invalidate_cache()
+                self.assertEqual(
+                    article_corrections.get_corrected_article(
+                        "Shop", "WB", "арт123"
+                    ),
+                    "ФАКТ 456",
+                )
+                self.assertEqual(
+                    article_corrections.get_corrected_article(
+                        "Shop", "OZON", "АРТ 123"
+                    ),
+                    "АРТ 123",
+                )
+                article_corrections.set_article_correction(
+                    "Shop", "WB", "АРТ 123", "арт123"
+                )
+                article_corrections.invalidate_cache()
+                self.assertEqual(
+                    article_corrections.get_corrected_article(
+                        "Shop", "WB", "АРТ 123"
+                    ),
+                    "АРТ 123",
+                )
+                self.assertEqual(json.loads(Path(path).read_text(encoding="utf-8")), {})
+
+    def test_current_and_future_rows_use_factual_article(self):
+        model = SupplyTreeModel()
+        delivery = model.add_delivery("supply.pdf", "Shop", "WB", "/prints")
+        model.add_articles(
+            delivery,
+            ["АРТ 123", "арт123", "OTHER"],
+            ["S", "XL", "M"],
+            ["", "", ""],
+            article_transform=lambda article: (
+                "ФАКТ 456" if article.casefold().replace(" ", "") == "арт123" else article
+            ),
+        )
+        self.assertEqual(
+            [delivery.child(index).article for index in range(3)],
+            ["ФАКТ 456", "ФАКТ 456", "OTHER"],
+        )
+        self.assertEqual(delivery.child(0).detected_article, "АРТ 123")
+        changed = model.update_articles_by_detected_article(
+            delivery, "АРТ 123", "ИСПРАВЛЕН"
+        )
+        self.assertEqual(changed, [0, 1])
+        self.assertEqual(delivery.articles, ["ИСПРАВЛЕН", "ИСПРАВЛЕН", "OTHER"])
+
+    def test_empty_factual_article_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "article_corrections.json")
+            with patch.object(article_corrections, "CORRECTIONS_FILE", path):
+                with self.assertRaises(ValueError):
+                    article_corrections.set_article_correction("Shop", "WB", "ART", " ")
+
+    def test_parse_finished_applies_saved_correction_before_search(self):
+        import gui.main_window as main_module
+
+        model = SupplyTreeModel()
+        delivery = model.add_delivery("supply.pdf", "Shop", "WB", "/prints")
+        fake_window = SimpleNamespace(
+            cancel_flag=SimpleNamespace(is_canceled=lambda: False),
+            tree_model=model,
+            _display_store_name=lambda name: name,
+            tree_view=Mock(),
+            auto_expand_delivery=True,
+            parse_dialog=None,
+        )
+        with patch.object(
+            main_module, "get_corrected_article", return_value="ФАКТ"
+        ) as corrected:
+            MainWindow._on_parse_finished(
+                fake_window, delivery, ["РАСПОЗНАН"], ["M"], [""], "UNKNOWN"
+            )
+        corrected.assert_called_once_with("Shop", "WB", "РАСПОЗНАН")
+        self.assertEqual(delivery.child(0).detected_article, "РАСПОЗНАН")
+        self.assertEqual(delivery.child(0).article, "ФАКТ")
+
+    def test_click_correction_updates_all_matching_rows(self):
+        import gui.main_window as main_module
+
+        model = SupplyTreeModel()
+        delivery = model.add_delivery("supply.pdf", "Shop", "WB", "/prints")
+        model.add_articles(delivery, ["RAW", "RAW"], ["S", "XL"], ["", ""])
+        dialog = Mock()
+        dialog.exec.return_value = QDialog.DialogCode.Accepted
+        dialog.factual_article.return_value = "ACTUAL"
+        fake_window = SimpleNamespace(is_searching=False, tree_model=model)
+        with patch.object(main_module, "ArticleCorrectionDialog", return_value=dialog), patch.object(
+            main_module, "set_article_correction", return_value="ACTUAL"
+        ) as save:
+            MainWindow.on_article_clicked(fake_window, delivery.child(0))
+        save.assert_called_once_with("Shop", "WB", "RAW", "ACTUAL")
+        self.assertEqual([delivery.child(0).article, delivery.child(1).article], ["ACTUAL", "ACTUAL"])
+
+    def test_new_ozon_task_format_uses_characteristic_size_and_location(self):
+        table = [[
+            "№", "Фото", "Товар", "Артикул", "Цвет", "Характеристики", "Кол.",
+        ], [
+            "1", "", "OZON КИЗ\nФутболка принт на\nспине",
+            "Артикул 2, XL", "чёрный", "Размер: XL · 52", "1",
+        ], [
+            "2", "", "OZON\nКружка", "Кружка 4, 0", "белый",
+            "Количество предметов:\n1", "1",
+        ], [
+            "3", "", "OZON\nФутболка", "Артикул, L", "белый",
+            "Размер: XL · 52", "1",
+        ]]
+        pdf = self._pdf_with_tables([table])
+        with patch("ozon_parser.pdfplumber.open", side_effect=[pdf, pdf]), patch(
+            "ozon_parser.mark_ozon_pdf_in_memory"
+        ) as marker:
+            self.assertEqual(
+                parse_ozon_supply("task.pdf"),
+                (
+                    ["Артикул 2", "Кружка 4", "Артикул, L"],
+                    ["XL", "0", "XL"],
+                    ["СПИНА", "", ""],
+                ),
+            )
+        marker.assert_not_called()
+
+    def test_new_builtin_sizes_keep_xxl_distinct_and_require_comma_for_one(self):
+        self.assertEqual(parse_article_and_size("ART, XXL", ()), ("ART", "XXL"))
+        self.assertEqual(parse_article_and_size("ART, 1", ()), ("ART", "1"))
+        self.assertEqual(parse_article_and_size("ART-1", ()), ("ART-1", "0"))
+        self.assertEqual(parse_article_and_size("ART 1", ()), ("ART 1", "0"))
+
+    def test_custom_sizes_and_numeric_separator_rule(self):
+        self.assertEqual(parse_article_and_size("ART, one size", ("One Size",)), ("ART", "ONESIZE"))
+        self.assertEqual(parse_article_and_size("ART-42", ("42",)), ("ART-42", "0"))
+        self.assertEqual(parse_article_and_size("ART, 42", ("42",)), ("ART", "42"))
+        self.assertEqual(parse_article_and_size("ART-Z(1)", ("Z(1)",)), ("ART", "Z(1)"))
+
+    def test_custom_size_validation(self):
+        self.assertEqual(clean_custom_sizes(["one size", " ONESIZE ", "", "XXL", "42"]), ["one size", "42"])
+        with self.assertRaises(ValueError):
+            validate_custom_size("X S", ["XS"])
+        with self.assertRaises(ValueError):
+            validate_custom_size("XS(M)")
+
     def test_supported_size_separators(self):
         self.assertEqual(parse_article_and_size("ART-XL"), ("ART", "XL"))
         self.assertEqual(parse_article_and_size("ART XL"), ("ART", "XL"))
@@ -216,6 +412,7 @@ class OverrideInteractionTests(unittest.TestCase):
         fake_window._remember_override_for_article = MethodType(
             MainWindow._remember_override_for_article, fake_window
         )
+        clipboard = Mock()
 
         with tempfile.TemporaryDirectory() as directory:
             selected = str(Path(directory) / "selected.tif")
@@ -231,6 +428,10 @@ class OverrideInteractionTests(unittest.TestCase):
                 main_module.QFileDialog, "getOpenFileName",
                 return_value=(selected, ""),
             ) as dialog, patch.object(
+                main_module.QApplication, "clipboard", return_value=clipboard,
+            ), patch.object(
+                main_module.QApplication, "processEvents",
+            ) as process_events, patch.object(
                 main_module, "set_overrides"
             ) as batch_save, patch.object(
                 main_module.QMessageBox, "information"
@@ -239,6 +440,9 @@ class OverrideInteractionTests(unittest.TestCase):
 
             self.assertEqual(dialog.call_count, 1)
             self.assertEqual(dialog.call_args.args[2], os.path.normpath(directory))
+            self.assertEqual(dialog.call_args.args[1], "Укажите путь артикула  ART-1 ")
+            clipboard.setText.assert_called_once_with(" ART-1 ")
+            process_events.assert_called_once_with()
             batch_save.assert_called_once_with(
                 "Shop", "WB",
                 [(" ART-1 ", "S"), ("ART-1", "XL"), ("ART-1", "S")],
@@ -569,6 +773,41 @@ class SettingsWindowTests(unittest.TestCase):
             }
             for number in range(count)
         }
+
+    def test_ozon_size_dictionary_add_edit_delete_persists_and_reloads(self):
+        import gui.settings_window as settings_module
+        import core.ozon_sizes as sizes_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(json.dumps({"other_setting": 7}), encoding="utf-8")
+            with patch.object(settings_module, "load_stores", return_value=self._stores(0)), patch.object(
+                settings_module, "get_data_path", side_effect=lambda name: str(Path(directory) / name)
+            ), patch.object(sizes_module, "get_data_path", side_effect=lambda name: str(Path(directory) / name)):
+                window = settings_module.SettingsWindow()
+                try:
+                    self.assertGreaterEqual(window.tabs.count(), 4)
+                    self.assertIn("Словарь размеров Ozon", [window.tabs.tabText(i) for i in range(window.tabs.count())])
+                    window.ozon_size_input.setText("One Size")
+                    window._add_ozon_size()
+                    self.assertEqual(json.loads(config_path.read_text(encoding="utf-8")), {
+                        "other_setting": 7, "ozon_custom_sizes": ["One Size"]
+                    })
+                    self.assertEqual(parse_article_and_size("ART, one size"), ("ART", "ONESIZE"))
+                    with patch.object(settings_module.QInputDialog, "getText", return_value=("Custom Size", True)):
+                        window._edit_ozon_size()
+                    self.assertEqual(parse_article_and_size("ART, custom size"), ("ART", "CUSTOMSIZE"))
+                    window._delete_ozon_size()
+                    self.assertEqual(json.loads(config_path.read_text(encoding="utf-8"))["ozon_custom_sizes"], [])
+                finally:
+                    window.close()
+                    self.app.processEvents()
+                reopened = settings_module.SettingsWindow()
+                try:
+                    self.assertEqual(reopened.ozon_custom_sizes, [])
+                finally:
+                    reopened.close()
+                    self.app.processEvents()
 
     def test_selecting_store_keeps_sidebar_scroll_and_button_instances(self):
         import gui.settings_window as settings_module

@@ -17,8 +17,38 @@ def _default_type_data():
     return {
         "path": "", "matcher": "Simple", "copy_on_override": False,
         "override_path": "", "source": "local", "png_only": False,
-        "size_ranges": [],
+        "size_ranges": [], "additional_sources": [],
     }
+
+
+def normalise_additional_sources(values, primary_source=None, primary_path=""):
+    def identity(source, path):
+        value = str(path or "").strip()
+        if source == "yandex":
+            value = value.replace("\\", "/")
+            if value.lower().startswith("disk:"):
+                value = "disk:" + value[5:]
+            value = value.rstrip("/") or "disk:/"
+        else:
+            value = os.path.abspath(os.path.expanduser(value)) if value else ""
+            value = os.path.normcase(os.path.normpath(value)) if value else ""
+        return source, value.casefold()
+
+    result = []
+    seen = set()
+    primary_kind = "yandex" if primary_source == "yandex" else "local"
+    primary_key = identity(primary_kind, primary_path)
+    for item in values if isinstance(values, list) else []:
+        if not isinstance(item, dict):
+            continue
+        source = "yandex" if item.get("source") == "yandex" else "local"
+        path = str(item.get("path", "")).strip()
+        key = identity(source, path)
+        if not path or key == primary_key or key in seen:
+            continue
+        seen.add(key)
+        result.append({"source": source, "path": path})
+    return result
 
 def _normalise_type_data(type_data):
     result = _default_type_data()
@@ -30,6 +60,10 @@ def _normalise_type_data(type_data):
         )
     elif not isinstance(result.get("size_ranges"), list):
         result["size_ranges"] = []
+    result["additional_sources"] = normalise_additional_sources(
+        result.get("additional_sources", []), result.get("source"),
+        result.get("path", ""),
+    )
     return result
 
 def load_stores():
@@ -61,6 +95,8 @@ def load_stores():
         elif isinstance(value, dict):
             for type_data in value.values():
                 if isinstance(type_data, dict) and "size_ranges" not in type_data:
+                    needs_migration = True
+                elif isinstance(type_data, dict) and "additional_sources" not in type_data:
                     needs_migration = True
 
     if needs_migration:
@@ -95,6 +131,32 @@ def save_stores(stores):
     global _stores_cache
     atomic_write_json(STORES_FILE, stores)
     _stores_cache = stores.copy()
+
+
+def prune_unused_indexes(stores):
+    referenced = []
+    for store_data in stores.values():
+        if not isinstance(store_data, dict):
+            continue
+        for type_data in store_data.values():
+            if not isinstance(type_data, dict):
+                continue
+            path = str(type_data.get("path", "")).strip()
+            if path:
+                referenced.append({
+                    "source": type_data.get("source", "local"), "path": path,
+                })
+            if type_data.get("copy_on_override"):
+                override = str(type_data.get("override_path", "")).strip()
+                if override:
+                    referenced.append({"source": "local", "path": override})
+            referenced.extend(type_data.get("additional_sources", []))
+    try:
+        from indexer import prune_unreferenced_sources
+        return prune_unreferenced_sources(referenced)
+    except (OSError, ValueError) as error:
+        print(f"[INDEX] Не удалось очистить общие источники: {error}")
+        return 0
 
 def get_store(store_name):
     stores = load_stores()

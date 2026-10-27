@@ -17,12 +17,16 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QDesktopServices
 
-from core.store_manager import load_stores, save_stores
+from core.store_manager import (
+    load_stores, normalise_additional_sources, prune_unused_indexes, save_stores,
+)
 from core.paths import get_data_path
 from core.json_storage import atomic_write_json
 from core.personalization import normalise_store_suffix_exclusions
 from indexer import (
+    normalise_source,
     remove_index_for_store,
+    update_source_index,
     update_index_for_store,
     update_yandex_indexes,
 )
@@ -192,13 +196,17 @@ class SettingsIndexWorker(QRunnable):
         def on_folder(path, folder_number, files_found):
             self.signals.folder_scanned.emit(path, folder_number, files_found)
 
-        update_index_for_store(
-            task["key"],
-            task["folder"],
-            override_path=task.get("override_path"),
-            force=True,
-            progress_callback=on_folder,
-        )
+        if task.get("shared_only"):
+            update_source_index(
+                task.get("source", "local"), task["folder"],
+                force_full=True, progress_callback=on_folder,
+            )
+        else:
+            update_index_for_store(
+                task["key"], task["folder"],
+                override_path=task.get("override_path"), force=True,
+                progress_callback=on_folder,
+            )
         self.signals.store_finished.emit(position, total, label)
         print(f"[INDEX] Завершено {position}/{total}: {label}")
 
@@ -387,6 +395,114 @@ class StoreSuffixExclusionsDialog(QDialog):
             for store_name, checkbox in self._checkboxes.items()
             if checkbox.isChecked()
         }
+
+
+class AdditionalSourcesDialog(QDialog):
+    def __init__(self, sources, known_sources, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Дополнительные источники")
+        self.resize(720, 430)
+        self.sources = deepcopy(sources or [])
+        self.known_sources = list(known_sources)
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "Источники проверяются сверху вниз только после основной папки."
+        )
+        layout.addWidget(hint)
+        self.list = QListWidget()
+        self.list.currentRowChanged.connect(self._update_actions)
+        layout.addWidget(self.list, 1)
+        add_row = QHBoxLayout()
+        existing = QPushButton("Из настроенных папок…")
+        existing.clicked.connect(self._add_existing)
+        add_row.addWidget(existing)
+        local = QPushButton("Добавить локальную…")
+        local.clicked.connect(self._add_local)
+        add_row.addWidget(local)
+        cloud = QPushButton("Добавить Яндекс Диск…")
+        cloud.setEnabled(not sys.platform.startswith("win"))
+        cloud.clicked.connect(self._add_cloud)
+        add_row.addWidget(cloud)
+        add_row.addStretch()
+        layout.addLayout(add_row)
+        actions = QHBoxLayout()
+        self.up = QPushButton("Вверх")
+        self.down = QPushButton("Вниз")
+        self.delete = QPushButton("Удалить")
+        self.up.clicked.connect(lambda: self._move(-1))
+        self.down.clicked.connect(lambda: self._move(1))
+        self.delete.clicked.connect(self._delete)
+        actions.addWidget(self.up)
+        actions.addWidget(self.down)
+        actions.addWidget(self.delete)
+        actions.addStretch()
+        layout.addLayout(actions)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._refresh()
+
+    def _label(self, source):
+        kind = "Яндекс Диск" if source.get("source") == "yandex" else "Локальная"
+        return f"{kind} · {source.get('path', '')}"
+
+    def _refresh(self, selected=None):
+        self.list.clear()
+        self.list.addItems([self._label(item) for item in self.sources])
+        if selected is not None and self.sources:
+            self.list.setCurrentRow(max(0, min(selected, len(self.sources) - 1)))
+        self._update_actions()
+
+    def _append(self, source, path):
+        candidate = {"source": source, "path": str(path or "").strip()}
+        cleaned = normalise_additional_sources([*self.sources, candidate])
+        if len(cleaned) == len(self.sources):
+            QMessageBox.warning(self, "Источник", "Такая папка уже добавлена.")
+            return
+        self.sources = cleaned
+        self._refresh(len(self.sources) - 1)
+
+    def _add_existing(self):
+        labels = [self._label(item) for item in self.known_sources]
+        if not labels:
+            QMessageBox.information(self, "Источники", "Других настроенных папок нет.")
+            return
+        label, accepted = QInputDialog.getItem(
+            self, "Выберите источник", "Папка:", labels, 0, False
+        )
+        if accepted:
+            self._append(**self.known_sources[labels.index(label)])
+
+    def _add_local(self):
+        path = QFileDialog.getExistingDirectory(self, "Выберите папку с принтами")
+        if path:
+            self._append("local", path)
+
+    def _add_cloud(self):
+        picker = YandexDiskPickerDialog(parent=self)
+        if picker.exec() == QDialog.Accepted:
+            self._append("yandex", picker.selected_path)
+
+    def _update_actions(self, *_):
+        row = self.list.currentRow()
+        self.up.setEnabled(row > 0)
+        self.down.setEnabled(0 <= row < len(self.sources) - 1)
+        self.delete.setEnabled(row >= 0)
+
+    def _move(self, offset):
+        row = self.list.currentRow()
+        target = row + offset
+        if row < 0 or target < 0 or target >= len(self.sources):
+            return
+        self.sources[row], self.sources[target] = self.sources[target], self.sources[row]
+        self._refresh(target)
+
+    def _delete(self):
+        row = self.list.currentRow()
+        if row >= 0:
+            del self.sources[row]
+            self._refresh(row)
 
 class SettingsWindow(QDialog):
     """Окно настроек магазинов с авто-сохранением."""
@@ -1231,6 +1347,7 @@ class SettingsWindow(QDialog):
             "source": "local",
             "png_only": False,
             "size_ranges": [],
+            "additional_sources": [],
         }
         self.stores[store_name][supply_type] = values.copy()
         self.type_vars.setdefault(store_name, {})[supply_type] = values.copy()
@@ -1252,6 +1369,9 @@ class SettingsWindow(QDialog):
                 "source": type_data.get("source", "local"),
                 "png_only": bool(type_data.get("png_only", False)),
                 "size_ranges": deepcopy(type_data.get("size_ranges", [])),
+                "additional_sources": deepcopy(
+                    type_data.get("additional_sources", [])
+                ),
             }
 
         vars_dict = self.type_vars[store_name][supply_type]
@@ -1413,6 +1533,20 @@ class SettingsWindow(QDialog):
 
         group_layout.addLayout(folder_layout)
 
+        additional_layout = QHBoxLayout()
+        additional_label = QLabel("Доп. источники:")
+        additional_label.setFixedWidth(120)
+        additional_layout.addWidget(additional_label)
+        additional_button = QPushButton(
+            f"Дополнительные источники… "
+            f"({len(vars_dict.get('additional_sources', []))})"
+        )
+        additional_button.clicked.connect(
+            lambda _checked=False, st=supply_type: self._edit_additional_sources(st)
+        )
+        additional_layout.addWidget(additional_button, 1)
+        group_layout.addLayout(additional_layout)
+
         # Разделитель
         separator = QFrame()
         separator.setFrameShape(QFrame.HLine)
@@ -1542,6 +1676,43 @@ class SettingsWindow(QDialog):
             self._auto_save()
             self.refresh_types_for_store(store_name)
 
+    def _known_sources(self, current_type):
+        result = []
+        seen = set()
+        current = self.type_vars[self.selected_store][current_type]
+        current_key = (
+            current.get("source", "local"), current.get("path", "").strip().casefold()
+        )
+        for store_data in self.stores.values():
+            for type_data in store_data.values():
+                if not isinstance(type_data, dict):
+                    continue
+                source = "yandex" if type_data.get("source") == "yandex" else "local"
+                path = type_data.get("path", "").strip()
+                key = (source, path.casefold())
+                if path and key != current_key and key not in seen:
+                    seen.add(key)
+                    result.append({"source": source, "path": path})
+        return result
+
+    def _edit_additional_sources(self, supply_type):
+        store_name = self.selected_store
+        values = self.type_vars.get(store_name, {}).get(supply_type)
+        if values is None:
+            return
+        dialog = AdditionalSourcesDialog(
+            values.get("additional_sources", []),
+            self._known_sources(supply_type), self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values["additional_sources"] = normalise_additional_sources(
+            dialog.sources, values.get("source"), values.get("path", "")
+        )
+        self.needs_reset_cache = True
+        self._auto_save()
+        self.refresh_types_for_store(store_name)
+
     def _on_png_only_toggled(self, supply_type, checked):
         store_name = self.selected_store
         if store_name in self.type_vars and supply_type in self.type_vars[store_name]:
@@ -1587,6 +1758,10 @@ class SettingsWindow(QDialog):
                     "source": vars_dict.get("source", "local"),
                     "png_only": bool(vars_dict.get("png_only", False)),
                     "size_ranges": deepcopy(vars_dict.get("size_ranges", [])),
+                    "additional_sources": normalise_additional_sources(
+                        vars_dict.get("additional_sources", []),
+                        vars_dict.get("source", "local"), path,
+                    ),
                 }
 
         for supply_type in set(list(old_store_data.keys()) + list(new_store_data.keys())):
@@ -1663,6 +1838,7 @@ class SettingsWindow(QDialog):
                     self.refresh_store_buttons()
                     self._clear_types()
                     save_stores(self.stores)
+                    prune_unused_indexes(self.stores)
                     return
 
         remove_index_for_store(f"{store_name}_{supply_type}")
@@ -1682,6 +1858,7 @@ class SettingsWindow(QDialog):
             del self.type_vars[store_name][supply_type]
 
         save_stores(self.stores)
+        prune_unused_indexes(self.stores)
         self.refresh_types_for_store(store_name)
         self.update_overrides_stats()
 
@@ -1773,6 +1950,7 @@ class SettingsWindow(QDialog):
 
         del self.stores[store_name]
         save_stores(self.stores)
+        prune_unused_indexes(self.stores)
 
         if os.path.exists(OVERRIDES_FILE):
             try:
@@ -1802,31 +1980,47 @@ class SettingsWindow(QDialog):
             self.select_store(next(iter(self.stores.keys())))
 
     def _index_tasks(self, store_names):
-        tasks = []
+        tasks_by_source = {}
         for store_name in store_names:
             store_data = self.stores.get(store_name, {})
             for supply_type, type_data in store_data.items():
                 if sys.platform.startswith("win") and type_data.get("source") == "yandex":
                     print(f"[INDEX] Пропущен {store_name} ({supply_type}): Яндекс Диск недоступен")
                     continue
-                folder = type_data.get("path", "").strip()
-                if not folder:
+                primary = type_data.get("path", "").strip()
+                if not primary:
                     print(f"[INDEX] Пропущен {store_name} ({supply_type}): папка не указана")
                     continue
-                override_path = None
-                if type_data.get("copy_on_override"):
-                    override_path = type_data.get("override_path", "").strip() or None
-                tasks.append({
-                    "key": f"{store_name}_{supply_type}",
-                    "label": (
-                        f"{self._display_store_name(store_name)} "
-                        f"({supply_type})"
-                    ),
-                    "folder": folder,
-                    "override_path": override_path,
+                sources = [{
                     "source": type_data.get("source", "local"),
-                })
-        return tasks
+                    "path": primary,
+                }]
+                if type_data.get("copy_on_override"):
+                    override = type_data.get("override_path", "").strip()
+                    if override:
+                        sources.insert(0, {"source": "local", "path": override})
+                sources.extend(type_data.get("additional_sources", []))
+                for source in sources:
+                    source_type = source.get("source", "local")
+                    folder = source.get("path", "").strip()
+                    if not folder:
+                        continue
+                    spec = normalise_source(source_type, folder)
+                    task = tasks_by_source.setdefault(spec["key"], {
+                        "key": f"source:{spec['key']}",
+                        "label": folder,
+                        "folder": folder,
+                        "source": source_type,
+                        "shared_only": True,
+                        "consumers": [],
+                    })
+                    task["consumers"].append(
+                        f"{self._display_store_name(store_name)} ({supply_type})"
+                    )
+        for task in tasks_by_source.values():
+            count = len(task["consumers"])
+            task["label"] = f"{task['folder']} · используется: {count}"
+        return list(tasks_by_source.values())
 
     def update_all_indexes(self):
         self._auto_save()

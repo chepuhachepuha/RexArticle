@@ -35,7 +35,7 @@ def load_matcher_config():
 class BaseMatcher:
     """Базовый класс для всех matcher'ов."""
 
-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None, size_ranges=None):
+    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None, size_ranges=None, index=None, include_override=True):
         raise NotImplementedError("Subclasses must implement find_file_by_article_and_size")
 
     def find_file_by_article(self, article, store_name):
@@ -84,9 +84,10 @@ class BaseMatcher:
         ]
 
     def _find_range_matches(
-        self, article, size_from_pdf, store_name, size_ranges, allowed_extensions
+        self, article, size_from_pdf, store_name, size_ranges, allowed_extensions,
+        index=None,
     ):
-        index = get_index_for_store(store_name)
+        index = get_index_for_store(store_name) if index is None else index
         wanted_size = normalize_article(size_from_pdf)
         candidates = self.article_candidates(article)
         for item in size_ranges or []:
@@ -108,21 +109,25 @@ class BaseMatcher:
 
     def find_with_override(
         self, article, size_from_pdf, store_name, search_func,
-        allowed_extensions=None, size_ranges=None,
+        allowed_extensions=None, size_ranges=None, index=None,
+        include_override=True,
     ):
         raw_article = article
         matches = self._find_range_matches(
             raw_article, size_from_pdf, store_name, size_ranges,
-            allowed_extensions,
+            allowed_extensions, index,
         )
         if not matches:
             article = normalize_article(raw_article)
-            matches = search_func(article, size_from_pdf, store_name)
+            matches = search_func(article, size_from_pdf, store_name, index)
         matches = self._filter_extensions(matches, allowed_extensions)
         if matches:
             return matches
 
-        override_path = self._check_manual_override(raw_article, size_from_pdf, store_name)
+        override_path = (
+            self._check_manual_override(raw_article, size_from_pdf, store_name)
+            if include_override else None
+        )
         if override_path:
             return [override_path]
         return []
@@ -140,9 +145,9 @@ class SimpleMatcher(BaseMatcher):
     def filter_matches(self, matches):
         return [path for path in matches if not path.lower().endswith(tuple(self.EXCLUDED_EXTENSIONS))]
 
-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None, size_ranges=None):
-        def search_func(art, size, store):
-            index = get_index_for_store(store)
+    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None, size_ranges=None, index=None, include_override=True):
+        def search_func(art, size, store, supplied_index):
+            index = get_index_for_store(store) if supplied_index is None else supplied_index
             if self._lookup(index, art):
                 # Фильтруем файлы, исключая .jpg
                 return self.filter_matches(self._lookup(index, art))
@@ -151,6 +156,7 @@ class SimpleMatcher(BaseMatcher):
         return self.find_with_override(
             article, size_from_pdf, store_name, search_func,
             allowed_extensions=allowed_extensions, size_ranges=size_ranges,
+            index=index, include_override=include_override,
         )
 
 
@@ -158,15 +164,16 @@ class RozenbergMatcher(BaseMatcher):
     def article_candidates(self, article):
         return [normalize_article(article).split('-', 1)[0]]
 
-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None, size_ranges=None):
-        def search_func(art, size, store):
-            index = get_index_for_store(store)
+    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None, size_ranges=None, index=None, include_override=True):
+        def search_func(art, size, store, supplied_index):
+            index = get_index_for_store(store) if supplied_index is None else supplied_index
             clean_article = art.split('-', 1)[0]
             return self._lookup(index, clean_article)
 
         return self.find_with_override(
             article, size_from_pdf, store_name, search_func,
             allowed_extensions=allowed_extensions, size_ranges=size_ranges,
+            index=index, include_override=include_override,
         )
 
 
@@ -176,9 +183,9 @@ class AlekseevMatcher(BaseMatcher):
         stripped = re.sub(r'(black|white)$', '', normalised)
         return list(dict.fromkeys((normalised, stripped)))
 
-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None, size_ranges=None):
-        def search_func(art, size, store):
-            index = get_index_for_store(store)
+    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None, size_ranges=None, index=None, include_override=True):
+        def search_func(art, size, store, supplied_index):
+            index = get_index_for_store(store) if supplied_index is None else supplied_index
             matches = self._lookup(index, art)
             if matches:
                 return matches
@@ -189,6 +196,7 @@ class AlekseevMatcher(BaseMatcher):
         return self.find_with_override(
             article, size_from_pdf, store_name, search_func,
             allowed_extensions=allowed_extensions, size_ranges=size_ranges,
+            index=index, include_override=include_override,
         )
 
 
@@ -196,14 +204,15 @@ class PdfOnlyMatcher(BaseMatcher):
     def filter_matches(self, matches):
         return [path for path in matches if path.lower().endswith('.pdf')]
 
-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None, size_ranges=None):
-        def search_func(art, size, store):
-            index = get_index_for_store(store)
+    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None, size_ranges=None, index=None, include_override=True):
+        def search_func(art, size, store, supplied_index):
+            index = get_index_for_store(store) if supplied_index is None else supplied_index
             return self.filter_matches(self._lookup(index, art))
 
         return self.find_with_override(
             article, size_from_pdf, store_name, search_func,
             allowed_extensions=allowed_extensions, size_ranges=size_ranges,
+            index=index, include_override=include_override,
         )
 
 
@@ -211,9 +220,9 @@ class KristabellMatcher(BaseMatcher):
     def article_candidates(self, article):
         return [normalize_article(str(article or "").replace("/", " "))]
 
-    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None, size_ranges=None):
-        def search_func(art, size, store):
-            index = get_index_for_store(store)
+    def find_file_by_article_and_size(self, article, size_from_pdf, store_name, allowed_extensions=None, size_ranges=None, index=None, include_override=True):
+        def search_func(art, size, store, supplied_index):
+            index = get_index_for_store(store) if supplied_index is None else supplied_index
             clean_article = self.article_candidates(art)[0]
             return self._lookup(index, clean_article)
 
@@ -221,6 +230,7 @@ class KristabellMatcher(BaseMatcher):
         return self.find_with_override(
             article, size_from_pdf, store_name, search_func,
             allowed_extensions=allowed_extensions, size_ranges=effective_ranges,
+            index=index, include_override=include_override,
         )
 
 

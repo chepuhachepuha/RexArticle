@@ -1,5 +1,6 @@
 """Инкрементальная индексация файлов принтов в SQLite."""
 import json
+import hashlib
 import os
 import sqlite3
 from core.text_normalization import normalize_article
@@ -9,16 +10,19 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from core.paths import get_data_dir
-from core.yandex_disk import YandexDiskClient, normalise_disk_path, to_yandex_uri
+from core.yandex_disk import (
+    YandexDiskClient, is_yandex_uri, normalise_disk_path, to_yandex_uri,
+)
 
 
 INDEX_DIR = os.path.join(get_data_dir(), "index")
 LEGACY_STATE_DIR = os.path.join(get_data_dir(), ".index_state")
 DB_FILENAME = "indexes.sqlite3"
 INDEX_CACHE = {}
+SOURCE_INDEX_CACHE = {}
 
 _SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".pdf", ".tiff", ".tif", ".bmp", ".webp"}
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _NETWORK_SCAN_RETRIES = 4
 
 
@@ -78,6 +82,38 @@ def _connect() -> sqlite3.Connection:
 
         CREATE INDEX IF NOT EXISTS idx_files_store_article
         ON files(store, article, priority, path);
+
+        CREATE TABLE IF NOT EXISTS source_state (
+            source_key TEXT PRIMARY KEY,
+            source_type TEXT NOT NULL,
+            root_path TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            last_scan_ns INTEGER NOT NULL DEFAULT 0,
+            snapshot_ready INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS source_directories (
+            source_key TEXT NOT NULL,
+            path TEXT NOT NULL,
+            parent_path TEXT,
+            mtime_ns INTEGER NOT NULL,
+            PRIMARY KEY (source_key, path),
+            FOREIGN KEY (source_key) REFERENCES source_state(source_key)
+                ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS source_files (
+            source_key TEXT NOT NULL,
+            path TEXT NOT NULL,
+            directory TEXT NOT NULL,
+            article TEXT NOT NULL,
+            PRIMARY KEY (source_key, path),
+            FOREIGN KEY (source_key) REFERENCES source_state(source_key)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_files_article
+        ON source_files(source_key, article, path);
         """
     )
     columns = {
@@ -88,6 +124,7 @@ def _connect() -> sqlite3.Connection:
             "ALTER TABLE store_state ADD COLUMN last_scan_ns INTEGER NOT NULL DEFAULT 0"
         )
         connection.commit()
+    _ensure_shared_migration(connection)
     legacy_stores = [
         row[0] for row in connection.execute(
             "SELECT store FROM store_state WHERE schema_version < ?",
@@ -125,6 +162,92 @@ def _normalise_path(path: str) -> str:
     return os.path.normpath(os.path.abspath(os.path.expanduser(path)))
 
 
+def normalise_source(source_type: str, path: str) -> dict:
+    kind = "yandex" if source_type == "yandex" else "local"
+    root = to_yandex_uri(path) if kind == "yandex" else _normalise_path(path)
+    identity = f"{kind}\0{root.casefold()}".encode("utf-8")
+    return {
+        "source": kind,
+        "path": root,
+        "key": hashlib.sha256(identity).hexdigest(),
+    }
+
+
+def _path_belongs_to_root(file_path: str, root_path: str) -> bool:
+    if is_yandex_uri(root_path):
+        root = root_path.rstrip("/")
+        return file_path == root or file_path.startswith(root + "/")
+    try:
+        return os.path.commonpath([file_path, root_path]) == root_path
+    except ValueError:
+        return False
+
+
+def _ensure_shared_migration(connection: sqlite3.Connection):
+    """Копирует v3-индексы в общие источники, не удаляя старые таблицы."""
+    user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if user_version >= 4:
+        return
+
+    legacy_count = connection.execute(
+        "SELECT COUNT(*) FROM store_state"
+    ).fetchone()[0]
+    backup_path = _get_db_path() + ".v3-backup"
+    if legacy_count and os.path.exists(_get_db_path()) and not os.path.exists(backup_path):
+        with sqlite3.connect(backup_path) as backup:
+            connection.backup(backup)
+        print(f"[INDEX] Создана резервная копия SQLite v3: {backup_path}")
+
+    roots_by_store = {}
+    for store, priority, path in connection.execute(
+        "SELECT store, priority, path FROM roots ORDER BY store, priority"
+    ):
+        source_type = "yandex" if is_yandex_uri(path) else "local"
+        spec = normalise_source(source_type, path)
+        roots_by_store.setdefault(store, []).append((priority, spec))
+
+    with connection:
+        for entries in roots_by_store.values():
+            for _priority, spec in entries:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO source_state(
+                        source_key, source_type, root_path, schema_version,
+                        last_scan_ns, snapshot_ready
+                    ) VALUES (?, ?, ?, ?, 0, 0)
+                    """,
+                    (spec["key"], spec["source"], spec["path"], _SCHEMA_VERSION),
+                )
+
+        for store, path, article in connection.execute(
+            "SELECT store, path, article FROM files"
+        ).fetchall():
+            candidates = [
+                spec for _priority, spec in roots_by_store.get(store, [])
+                if _path_belongs_to_root(path, spec["path"])
+            ]
+            if not candidates:
+                continue
+            spec = max(candidates, key=lambda item: len(item["path"]))
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO source_files(
+                    source_key, path, directory, article
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    spec["key"], path, os.path.dirname(path),
+                    normalize_article(article),
+                ),
+            )
+        connection.execute("PRAGMA user_version = 4")
+    if roots_by_store:
+        print(
+            f"[INDEX] SQLite v4: общие источники подготовлены для "
+            f"{len(roots_by_store)} индексов без повторного чтения файлов"
+        )
+
+
 def _roots(folder_path: str, override_path: str = None) -> list[dict]:
     roots = []
     for priority, path in enumerate((override_path, folder_path)):
@@ -141,8 +264,13 @@ def _is_network_path(path: str) -> bool:
 
     lowered = normalised.casefold()
     if sys.platform == "darwin" and normalised.startswith("/Volumes/"):
-        # WebDAV/Finder обычно монтирует сетевые ресурсы в /Volumes.
-        return any(marker in lowered for marker in ("webdav", "yandex", "dav"))
+        # Проверяем только имя подключённого тома. Обычная папка YandexDisk
+        # внутри физического диска (например /Volumes/Transcend/...) остаётся
+        # локальным источником и должна автоматически переиндексироваться.
+        volume_name = normalised[len("/Volumes/"):].split("/", 1)[0].casefold()
+        return any(
+            marker in volume_name for marker in ("webdav", "yandex", "dav")
+        )
 
     if os.name == "nt":
         try:
@@ -277,6 +405,308 @@ def _index_from_files(files: dict) -> dict:
     return index
 
 
+def _load_source_state(connection, source_key: str):
+    state = connection.execute(
+        """
+        SELECT source_type, root_path, schema_version, last_scan_ns, snapshot_ready
+        FROM source_state WHERE source_key = ?
+        """,
+        (source_key,),
+    ).fetchone()
+    files = {
+        path: {"article": article, "directory": directory}
+        for path, directory, article in connection.execute(
+            "SELECT path, directory, article FROM source_files WHERE source_key = ?",
+            (source_key,),
+        )
+    }
+    directories = {
+        path: {"parent": parent, "mtime_ns": mtime_ns}
+        for path, parent, mtime_ns in connection.execute(
+            """
+            SELECT path, parent_path, mtime_ns FROM source_directories
+            WHERE source_key = ?
+            """,
+            (source_key,),
+        )
+    }
+    return state, files, directories
+
+
+def _scan_local_source_full(root_path, progress_callback=None, cancel_token=None):
+    files = {}
+    directories = {}
+    folder_number = 0
+
+    def walk(folder_path, parent_path=None):
+        nonlocal folder_number
+        if cancel_token:
+            cancel_token.raise_if_cancelled()
+        stat = os.stat(folder_path, follow_symlinks=False)
+        directories[folder_path] = {
+            "parent": parent_path,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+        folder_number += 1
+        if progress_callback:
+            progress_callback(folder_path, folder_number, len(files))
+        with os.scandir(folder_path) as iterator:
+            entries = list(iterator)
+        for entry in entries:
+            if cancel_token:
+                cancel_token.raise_if_cancelled()
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    walk(_normalise_path(entry.path), folder_path)
+                    continue
+                extension = os.path.splitext(entry.name)[1].lower()
+                if extension not in _SUPPORTED_EXTENSIONS:
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                path = _normalise_path(entry.path)
+                files[path] = {
+                    "article": normalize_article(os.path.splitext(entry.name)[0]),
+                    "directory": folder_path,
+                }
+            except OSError:
+                continue
+
+    walk(root_path)
+    return files, directories, folder_number, 0
+
+
+def _scan_local_source_incremental(
+    root_path, previous_files, previous_directories,
+    progress_callback=None, cancel_token=None,
+):
+    files = {}
+    directories = {}
+    children = {}
+    direct_files = {}
+    for path, info in previous_directories.items():
+        children.setdefault(info["parent"], []).append(path)
+    for path, info in previous_files.items():
+        direct_files.setdefault(info["directory"], {})[path] = info
+
+    checked = 0
+    reused_files = 0
+
+    def walk(folder_path, parent_path=None):
+        nonlocal checked, reused_files
+        if cancel_token:
+            cancel_token.raise_if_cancelled()
+        checked += 1
+        stat = os.stat(folder_path, follow_symlinks=False)
+        previous = previous_directories.get(folder_path)
+        current = {"parent": parent_path, "mtime_ns": stat.st_mtime_ns}
+        directories[folder_path] = current
+        if progress_callback:
+            progress_callback(folder_path, checked, len(files))
+
+        if previous and previous["mtime_ns"] == stat.st_mtime_ns:
+            known_files = direct_files.get(folder_path, {})
+            files.update(known_files)
+            reused_files += len(known_files)
+            for child in children.get(folder_path, []):
+                try:
+                    walk(child, folder_path)
+                except FileNotFoundError:
+                    continue
+            return
+
+        with os.scandir(folder_path) as iterator:
+            entries = list(iterator)
+        for entry in entries:
+            if cancel_token:
+                cancel_token.raise_if_cancelled()
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    walk(_normalise_path(entry.path), folder_path)
+                    continue
+                extension = os.path.splitext(entry.name)[1].lower()
+                if extension not in _SUPPORTED_EXTENSIONS:
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                path = _normalise_path(entry.path)
+                files[path] = {
+                    "article": normalize_article(os.path.splitext(entry.name)[0]),
+                    "directory": folder_path,
+                }
+            except OSError:
+                continue
+
+    walk(root_path)
+    return files, directories, checked, reused_files
+
+
+def get_index_for_source(source_type: str, path: str) -> dict:
+    spec = normalise_source(source_type, path)
+    if spec["key"] in SOURCE_INDEX_CACHE:
+        return SOURCE_INDEX_CACHE[spec["key"]]
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT article, path FROM source_files
+            WHERE source_key = ? ORDER BY article COLLATE NOCASE, path COLLATE NOCASE
+            """,
+            (spec["key"],),
+        ).fetchall()
+    index = {}
+    for article, file_path in rows:
+        index.setdefault(normalize_article(article), []).append(file_path)
+    SOURCE_INDEX_CACHE[spec["key"]] = index
+    return index
+
+
+def has_source_index(source_type: str, path: str) -> bool:
+    spec = normalise_source(source_type, path)
+    with _connect() as connection:
+        return connection.execute(
+            "SELECT 1 FROM source_state WHERE source_key = ?",
+            (spec["key"],),
+        ).fetchone() is not None
+
+
+def prune_unreferenced_sources(referenced_sources) -> int:
+    referenced_keys = {
+        normalise_source(item.get("source", "local"), item.get("path", ""))["key"]
+        for item in referenced_sources
+        if isinstance(item, dict) and str(item.get("path", "")).strip()
+    }
+    with _connect() as connection:
+        existing = {
+            row[0] for row in connection.execute("SELECT source_key FROM source_state")
+        }
+        unused = existing - referenced_keys
+        with connection:
+            connection.executemany(
+                "DELETE FROM source_state WHERE source_key = ?",
+                ((key,) for key in unused),
+            )
+    for key in unused:
+        SOURCE_INDEX_CACHE.pop(key, None)
+    if unused:
+        INDEX_CACHE.clear()
+        print(f"[INDEX] Удалено неиспользуемых общих источников: {len(unused)}")
+    return len(unused)
+
+
+def update_source_index(
+    source_type: str,
+    path: str,
+    *,
+    force_full=False,
+    progress_callback=None,
+    cancel_token=None,
+) -> bool:
+    spec = normalise_source(source_type, path)
+    if spec["source"] == "yandex":
+        return _update_yandex_source_index(
+            spec, force=force_full, progress_callback=progress_callback,
+            cancel_token=cancel_token,
+        )
+
+    started = time.perf_counter()
+    with _connect() as connection:
+        state, previous_files, previous_directories = _load_source_state(
+            connection, spec["key"]
+        )
+    if _is_network_path(spec["path"]) and state and not force_full:
+        get_index_for_source(spec["source"], spec["path"])
+        print(f"[INDEX] Общий сетевой индекс используется без обхода: {spec['path']}")
+        return False
+    if not os.path.isdir(spec["path"]):
+        if state:
+            print(f"[INDEX] Источник временно недоступен, сохранён индекс: {spec['path']}")
+            return False
+        raise FileNotFoundError(spec["path"])
+
+    snapshot_ready = bool(state and state[4])
+    if force_full or not snapshot_ready:
+        new_files, new_directories, checked, reused = _scan_local_source_full(
+            spec["path"], progress_callback, cancel_token
+        )
+        mode = "полная проверка"
+    else:
+        new_files, new_directories, checked, reused = _scan_local_source_incremental(
+            spec["path"], previous_files, previous_directories,
+            progress_callback, cancel_token,
+        )
+        mode = "быстрая проверка"
+
+    removed = set(previous_files) - set(new_files)
+    added = set(new_files) - set(previous_files)
+    changed = {
+        file_path for file_path in set(previous_files) & set(new_files)
+        if previous_files[file_path] != new_files[file_path]
+    }
+    with _connect() as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO source_state(
+                    source_key, source_type, root_path, schema_version,
+                    last_scan_ns, snapshot_ready
+                ) VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    source_type=excluded.source_type,
+                    root_path=excluded.root_path,
+                    schema_version=excluded.schema_version,
+                    last_scan_ns=excluded.last_scan_ns,
+                    snapshot_ready=1
+                """,
+                (
+                    spec["key"], spec["source"], spec["path"],
+                    _SCHEMA_VERSION, time.time_ns(),
+                ),
+            )
+            connection.executemany(
+                "DELETE FROM source_files WHERE source_key = ? AND path = ?",
+                ((spec["key"], value) for value in removed | changed),
+            )
+            connection.executemany(
+                """
+                INSERT OR REPLACE INTO source_files(
+                    source_key, path, directory, article
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    (
+                        spec["key"], value, new_files[value]["directory"],
+                        new_files[value]["article"],
+                    )
+                    for value in added | changed
+                ),
+            )
+            connection.execute(
+                "DELETE FROM source_directories WHERE source_key = ?",
+                (spec["key"],),
+            )
+            connection.executemany(
+                """
+                INSERT INTO source_directories(
+                    source_key, path, parent_path, mtime_ns
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    (
+                        spec["key"], directory, info["parent"], info["mtime_ns"]
+                    )
+                    for directory, info in new_directories.items()
+                ),
+            )
+    SOURCE_INDEX_CACHE.pop(spec["key"], None)
+    elapsed = (time.perf_counter() - started) * 1000
+    print(
+        f"[INDEX] {mode}: {spec['path']} · +{len(added)} ~{len(changed)} "
+        f"-{len(removed)}, файлов {len(new_files)}, каталогов {checked}, "
+        f"переиспользовано {reused} за {elapsed:.0f} мс"
+    )
+    return bool(added or changed or removed or not snapshot_ready)
+
+
 def _load_legacy_index(store_name: str) -> dict:
     try:
         with open(_get_legacy_index_path(store_name), "r", encoding="utf-8") as file:
@@ -355,49 +785,69 @@ def load_all_indexes_to_memory():
 
 
 def get_index_for_store(store_name: str) -> dict:
-    """Лениво загружает индекс магазина из SQLite в быстрый кэш памяти."""
+    """Совместимый объединённый вид основных источников магазина."""
     if store_name in INDEX_CACHE:
         return INDEX_CACHE[store_name]
 
     with _connect() as connection:
-        rows = connection.execute(
-            """
-            SELECT article, path
-            FROM files
-            WHERE store = ?
-            ORDER BY article COLLATE NOCASE, priority, path COLLATE NOCASE
-            """,
+        roots = connection.execute(
+            "SELECT path FROM roots WHERE store = ? ORDER BY priority",
             (store_name,),
         ).fetchall()
-        has_state = connection.execute(
-            "SELECT 1 FROM store_state WHERE store = ?", (store_name,)
-        ).fetchone()
-
-    if rows or has_state:
-        index = {}
-        for article, path in rows:
-            index.setdefault(normalize_article(article), []).append(path)
-    else:
-        # Совместимость до первой SQLite-синхронизации.
-        legacy_index = _load_legacy_index(store_name)
-        index = {}
-        for article, paths in legacy_index.items():
-            index.setdefault(normalize_article(article), []).extend(paths)
+    index = {}
+    for (root_path,) in roots:
+        source_type = "yandex" if is_yandex_uri(root_path) else "local"
+        source_index = get_index_for_source(source_type, root_path)
+        for article, paths in source_index.items():
+            bucket = index.setdefault(article, [])
+            for file_path in paths:
+                if file_path not in bucket:
+                    bucket.append(file_path)
+    if not roots:
+        with _connect() as connection:
+            legacy_rows = connection.execute(
+                """
+                SELECT article, path FROM files WHERE store = ?
+                ORDER BY article COLLATE NOCASE, priority, path COLLATE NOCASE
+                """,
+                (store_name,),
+            ).fetchall()
+        for article, file_path in legacy_rows:
+            index.setdefault(normalize_article(article), []).append(file_path)
+        if not legacy_rows:
+            legacy_index = _load_legacy_index(store_name)
+            for article, paths in legacy_index.items():
+                index.setdefault(normalize_article(article), []).extend(paths)
 
     INDEX_CACHE[store_name] = index
     return index
 
 
+def remove_missing_path_from_index(store_name: str, file_path: str) -> bool:
+    """Удаляет подтверждённо отсутствующий локальный файл из SQLite и кэша."""
+    if not file_path or is_yandex_uri(file_path) or os.path.exists(file_path):
+        return False
+
+    with _connect() as connection:
+        with connection:
+            legacy_cursor = connection.execute(
+                "DELETE FROM files WHERE store = ? AND path = ?",
+                (store_name, file_path),
+            )
+            source_cursor = connection.execute(
+                "DELETE FROM source_files WHERE path = ?", (file_path,)
+            )
+    removed = legacy_cursor.rowcount > 0 or source_cursor.rowcount > 0
+    if removed:
+        INDEX_CACHE.pop(store_name, None)
+        SOURCE_INDEX_CACHE.clear()
+        print(f"[INDEX] Удалён недоступный путь {store_name}: {file_path}")
+    return removed
+
+
 def has_yandex_index_for_store(store_name: str, cloud_path: str) -> bool:
     """Проверяет наличие готового индекса именно для облачной папки."""
-    expected_roots = [{"path": to_yandex_uri(cloud_path), "priority": 1}]
-    with _connect() as connection:
-        state, roots, _ = _load_store_state(connection, store_name)
-    return bool(
-        state is not None
-        and state[0] == _SCHEMA_VERSION
-        and roots == expected_roots
-    )
+    return has_source_index("yandex", cloud_path)
 
 
 def update_index_for_store(
@@ -407,133 +857,36 @@ def update_index_for_store(
     force: bool = False,
     progress_callback=None,
     cancel_token=None,
+    updated_source_keys=None,
 ) -> bool:
-    """Инкрементально синхронизирует файловый индекс магазина с SQLite."""
-    started = time.perf_counter()
+    """Обновляет общие корни и сохраняет совместимую привязку магазина."""
     roots = _roots(folder_path, override_path)
-
+    changed = False
+    for root in roots:
+        spec = normalise_source("local", root["path"])
+        if updated_source_keys is not None and spec["key"] in updated_source_keys:
+            continue
+        changed = update_source_index(
+            "local", root["path"], force_full=force,
+            progress_callback=progress_callback, cancel_token=cancel_token,
+        ) or changed
+        if updated_source_keys is not None:
+            updated_source_keys.add(spec["key"])
     with _connect() as connection:
-        previous_state, previous_roots, previous_files = _load_store_state(connection, store_name)
-        schema_is_valid = (
-            previous_state is not None
-            and previous_state[0] == _SCHEMA_VERSION
-        )
-        roots_are_current = previous_roots == roots
-        is_network = any(_is_network_path(root["path"]) for root in roots)
-        if (
-            is_network
-            and schema_is_valid
-            and roots_are_current
-            and not force
-        ):
-            index = _index_from_files(previous_files)
-            INDEX_CACHE[store_name] = index
-            print(
-                f"[INDEX] {store_name}: сетевой SQLite-индекс, {len(index)} артикулов; "
-                "WebDAV не сканируется при поиске"
-            )
-            return False
-
-        unavailable_network_roots = [
-            root["path"]
-            for root in roots
-            if _is_network_path(root["path"]) and not os.path.isdir(root["path"])
-        ]
-        if schema_is_valid and unavailable_network_roots:
-            index = _index_from_files(previous_files)
-            INDEX_CACHE[store_name] = index
-            print(
-                f"[INDEX] {store_name}: сетевой диск недоступен, сохранён SQLite-кэш "
-                f"({len(index)} артикулов)"
-            )
-            return False
-
-        try:
-            current_files = _scan_files(roots, progress_callback=progress_callback, cancel_token=cancel_token)
-        except NetworkScanError as error:
-            if not schema_is_valid:
-                raise
-            index = _index_from_files(previous_files)
-            INDEX_CACHE[store_name] = index
-            print(
-                f"[INDEX] {store_name}: неполный ответ WebDAV, сохранён прежний "
-                f"SQLite-индекс ({len(index)} артикулов). Причина: {error}"
-            )
-            return False
-        if cancel_token:
-            cancel_token.raise_if_cancelled()
-        scanned_at_ns = time.time_ns()
-        full_rebuild = not schema_is_valid
-
-        if full_rebuild:
-            added_paths = set(current_files)
-            changed_paths = set()
-            removed_paths = set(previous_files)
-        else:
-            removed_paths = previous_files.keys() - current_files.keys()
-            added_paths = current_files.keys() - previous_files.keys()
-            changed_paths = {
-                path
-                for path in current_files.keys() & previous_files.keys()
-                if any(
-                    current_files[path][key] != previous_files[path][key]
-                    for key in ("article", "mtime_ns", "size", "priority")
-                )
-            }
-
         with connection:
-            if full_rebuild:
-                connection.execute("DELETE FROM store_state WHERE store = ?", (store_name,))
-                connection.execute(
-                    "INSERT INTO store_state(store, schema_version, last_scan_ns) VALUES (?, ?, ?)",
-                    (store_name, _SCHEMA_VERSION, scanned_at_ns),
-                )
-                connection.executemany(
-                    "INSERT INTO roots(store, priority, path) VALUES (?, ?, ?)",
-                    ((store_name, root["priority"], root["path"]) for root in roots),
-                )
-                _upsert_files(connection, store_name, current_files, current_files.keys())
-            else:
-                connection.execute(
-                    "UPDATE store_state SET last_scan_ns = ? WHERE store = ?",
-                    (scanned_at_ns, store_name),
-                )
-                if not roots_are_current:
-                    connection.execute("DELETE FROM roots WHERE store = ?", (store_name,))
-                    connection.executemany(
-                        "INSERT INTO roots(store, priority, path) VALUES (?, ?, ?)",
-                        ((store_name, root["priority"], root["path"]) for root in roots),
-                    )
-                connection.executemany(
-                    "DELETE FROM files WHERE store = ? AND path = ?",
-                    ((store_name, path) for path in removed_paths | changed_paths),
-                )
-                _upsert_files(
-                    connection,
-                    store_name,
-                    current_files,
-                    added_paths | changed_paths,
-                )
-
-    index_changed = bool(full_rebuild or added_paths or changed_paths or removed_paths)
-    index = _index_from_files(current_files)
-    INDEX_CACHE[store_name] = index
+            connection.execute("DELETE FROM roots WHERE store = ?", (store_name,))
+            connection.execute("DELETE FROM store_state WHERE store = ?", (store_name,))
+            connection.execute(
+                "INSERT INTO store_state(store, schema_version, last_scan_ns) VALUES (?, ?, ?)",
+                (store_name, _SCHEMA_VERSION, time.time_ns()),
+            )
+            connection.executemany(
+                "INSERT INTO roots(store, priority, path) VALUES (?, ?, ?)",
+                ((store_name, root["priority"], root["path"]) for root in roots),
+            )
+    INDEX_CACHE.pop(store_name, None)
     _remove_legacy_files(store_name)
-
-    elapsed = (time.perf_counter() - started) * 1000
-    if index_changed:
-        action = (
-            "полная SQLite-сборка"
-            if full_rebuild
-            else f"SQLite +{len(added_paths)} ~{len(changed_paths)} -{len(removed_paths)}"
-        )
-    else:
-        action = "SQLite актуален"
-    print(
-        f"[INDEX] {store_name}: {action}, {len(index)} артикулов, "
-        f"{len(current_files)} файлов за {elapsed:.0f} мс"
-    )
-    return index_changed
+    return changed
 
 
 def _modified_to_ns(value: str) -> int:
@@ -544,6 +897,81 @@ def _modified_to_ns(value: str) -> int:
         return int(parsed.timestamp() * 1_000_000_000)
     except (ValueError, OverflowError):
         return 0
+
+
+def _update_yandex_source_index(
+    spec, *, force=False, client=None, token=None,
+    progress_callback=None, cancel_token=None,
+):
+    started = time.perf_counter()
+    with _connect() as connection:
+        state, previous_files, _directories = _load_source_state(
+            connection, spec["key"]
+        )
+    if not force:
+        if state:
+            get_index_for_source("yandex", spec["path"])
+            print(f"[INDEX API] Используется общий SQLite-индекс: {spec['path']}")
+        else:
+            print(f"[INDEX API] Общий индекс ещё не создан: {spec['path']}")
+        return False
+
+    client = client or YandexDiskClient(token)
+    additions = {}
+
+    def api_progress(page, remote_seen, accepted):
+        if progress_callback:
+            progress_callback(
+                f"{spec['path']} · проверка API {page}", page, accepted
+            )
+
+    for resource in client.iter_files(
+        spec["path"], progress_callback=api_progress
+    ):
+        if cancel_token:
+            cancel_token.raise_if_cancelled()
+        if resource.uri in previous_files:
+            continue
+        article, extension = os.path.splitext(resource.name)
+        if extension.lower() not in _SUPPORTED_EXTENSIONS:
+            continue
+        additions[resource.uri] = {
+            "article": normalize_article(article),
+            "directory": os.path.dirname(resource.uri),
+        }
+
+    with _connect() as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO source_state(
+                    source_key, source_type, root_path, schema_version,
+                    last_scan_ns, snapshot_ready
+                ) VALUES (?, 'yandex', ?, ?, ?, 0)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    last_scan_ns=excluded.last_scan_ns,
+                    schema_version=excluded.schema_version
+                """,
+                (spec["key"], spec["path"], _SCHEMA_VERSION, time.time_ns()),
+            )
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO source_files(
+                    source_key, path, directory, article
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    (spec["key"], path, info["directory"], info["article"])
+                    for path, info in additions.items()
+                ),
+            )
+    SOURCE_INDEX_CACHE.pop(spec["key"], None)
+    elapsed = (time.perf_counter() - started) * 1000
+    print(
+        f"[INDEX API] Общий источник {spec['path']}: +{len(additions)}, "
+        f"всего {len(previous_files) + len(additions)} за {elapsed:.0f} мс"
+    )
+    return bool(additions or not state)
 
 
 def update_yandex_index_for_store(
@@ -557,6 +985,27 @@ def update_yandex_index_for_store(
     cancel_token=None,
 ) -> bool:
     """Инкрементально синхронизирует SQLite через REST API Яндекс Диска."""
+    spec = normalise_source("yandex", cloud_path)
+    changed = _update_yandex_source_index(
+        spec, force=force, client=client, token=token,
+        progress_callback=progress_callback, cancel_token=cancel_token,
+    )
+    with _connect() as connection:
+        with connection:
+            connection.execute("DELETE FROM roots WHERE store = ?", (store_name,))
+            connection.execute("DELETE FROM store_state WHERE store = ?", (store_name,))
+            connection.execute(
+                "INSERT INTO store_state(store, schema_version, last_scan_ns) VALUES (?, ?, ?)",
+                (store_name, _SCHEMA_VERSION, time.time_ns()),
+            )
+            connection.execute(
+                "INSERT INTO roots(store, priority, path) VALUES (?, 1, ?)",
+                (store_name, spec["path"]),
+            )
+    INDEX_CACHE.pop(store_name, None)
+    return changed
+
+    # Legacy v3 implementation kept below as a readable migration reference.
     started = time.perf_counter()
     root_uri = to_yandex_uri(cloud_path)
     roots = [{"path": root_uri, "priority": 1}]
@@ -758,19 +1207,25 @@ def update_yandex_indexes(
     def run_group(group):
         client = YandexDiskClient()
         group_results = {}
+        processed_sources = {}
         for position, task in group:
             if cancel_token:
                 cancel_token.raise_if_cancelled()
             if on_store_started:
                 on_store_started(position, total, task)
-            group_results[task["key"]] = update_yandex_index_for_store(
+            source_key = normalise_source("yandex", task["folder"])["key"]
+            duplicate = source_key in processed_sources
+            changed = update_yandex_index_for_store(
                 task["key"],
                 task["folder"],
                 client=client,
-                force=True,
+                force=not duplicate,
                 progress_callback=task.get("progress_callback"),
                 cancel_token=cancel_token,
             )
+            if not duplicate:
+                processed_sources[source_key] = changed
+            group_results[task["key"]] = processed_sources[source_key]
             if on_store_finished:
                 on_store_finished(position, total, task)
         return group_results

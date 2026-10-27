@@ -33,7 +33,12 @@ from parser import parse_wb_supply
 from ozon_parser import parse_ozon_supply
 from supply_detector import detect_supply_type
 from indexer import (
+    get_index_for_source,
+    has_source_index,
     has_yandex_index_for_store,
+    normalise_source,
+    remove_missing_path_from_index,
+    update_source_index,
     update_index_for_store,
     update_yandex_indexes,
 )
@@ -308,10 +313,24 @@ class IndexRebuildWorker(QRunnable):
     def run(self):
         try:
             total = len(self.stores_to_rebuild)
+            updated_source_keys = set()
             for i, (key, info) in enumerate(self.stores_to_rebuild.items(), start=1):
                 if self.cancel_token:
                     self.cancel_token.raise_if_cancelled()
                 self.signals.progress.emit(i, total, f"{info['store_name']} ({info['supply_type']})")
+                for source in info.get("additional_sources", []):
+                    source_type = source.get("source", "local")
+                    source_path = source.get("path", "").strip()
+                    if not source_path or source_type == "yandex":
+                        continue
+                    spec = normalise_source(source_type, source_path)
+                    if spec["key"] in updated_source_keys:
+                        continue
+                    update_source_index(
+                        source_type, source_path, force_full=False,
+                        cancel_token=self.cancel_token,
+                    )
+                    updated_source_keys.add(spec["key"])
                 if info.get("source") == "yandex":
                     print(
                         f"[INDEX] {key}: облачная автоиндексация при поиске "
@@ -323,6 +342,7 @@ class IndexRebuildWorker(QRunnable):
                     override_path=info.get("override_path"),
                     force=info.get("force", False),
                     cancel_token=self.cancel_token,
+                    updated_source_keys=updated_source_keys,
                 )
             self.signals.finished.emit()
         except OperationCancelled:
@@ -348,24 +368,34 @@ class CloudAutoIndexWorker(QRunnable):
     def run(self):
         stores = load_stores()
         print("[INDEX AUTO] Запущено фоновое append-only обновление облака")
-        tasks = []
-        total_cloud_indexes = 0
+        tasks_by_source = {}
         for store_name, store_data in stores.items():
             for supply_type, type_data in store_data.items():
-                if type_data.get("source", "local") != "yandex":
-                    continue
-                cloud_path = type_data.get("path", "").strip()
-                if not cloud_path:
-                    continue
-                total_cloud_indexes += 1
-                key = f"{store_name}_{supply_type}"
-                if not has_yandex_index_for_store(key, cloud_path):
-                    print(
-                        f"[INDEX AUTO] {key}: пропущен — сначала выполните "
-                        "ручную полную сверку"
-                    )
-                    continue
-                tasks.append({"key": key, "folder": cloud_path})
+                candidates = list(type_data.get("additional_sources", []))
+                if type_data.get("source", "local") == "yandex":
+                    candidates.insert(0, {
+                        "source": "yandex", "path": type_data.get("path", "")
+                    })
+                for source in candidates:
+                    if source.get("source") != "yandex":
+                        continue
+                    cloud_path = source.get("path", "").strip()
+                    if not cloud_path:
+                        continue
+                    spec = normalise_source("yandex", cloud_path)
+                    tasks_by_source.setdefault(spec["key"], {
+                        "key": f"source:{spec['key']}", "folder": cloud_path,
+                    })
+        total_cloud_indexes = len(tasks_by_source)
+        tasks = []
+        for task in tasks_by_source.values():
+            if not has_source_index("yandex", task["folder"]):
+                print(
+                    f"[INDEX AUTO] {task['folder']}: пропущен — сначала "
+                    "выполните ручную полную сверку"
+                )
+                continue
+            tasks.append(task)
         try:
             results = update_yandex_indexes(tasks, cancel_token=self.cancel_token)
             changed_count = sum(bool(changed) for changed in results.values())
@@ -461,6 +491,29 @@ class SearchWorker(QRunnable):
         os.makedirs(output_folder, exist_ok=True)
 
         not_found_items = []
+        delivery_item.index_warning = False
+        additional_indexes = []
+        for source in type_data.get("additional_sources", []):
+            source_type = source.get("source", "local")
+            source_path = source.get("path", "").strip()
+            if not source_path:
+                continue
+            if source_type != "yandex" and not os.path.isdir(source_path):
+                delivery_item.index_warning = True
+                print(
+                    f"[ПОИСК] Дополнительный источник недоступен: {source_path}"
+                )
+                continue
+            if not has_source_index(source_type, source_path):
+                delivery_item.index_warning = True
+                print(
+                    f"[ПОИСК] Дополнительный источник пропущен: "
+                    f"индекс отсутствует ({source_path})"
+                )
+                continue
+            additional_indexes.append(
+                (source, get_index_for_source(source_type, source_path))
+            )
 
         for i in range(delivery_item.child_count()):
             if self.cancel_token:
@@ -470,46 +523,97 @@ class SearchWorker(QRunnable):
             size = article_item.size
             location = article_item.location
 
-            matches = matcher.find_file_by_article_and_size(
+            match_groups = []
+            primary_matches = matcher.find_file_by_article_and_size(
                 article, size, index_store_name,
                 allowed_extensions=allowed_extensions,
                 size_ranges=type_data.get("size_ranges", []),
+                include_override=False,
             )
+            if primary_matches:
+                match_groups.append(primary_matches)
 
-            if matches:
-                file = matches[0]
-                self.signals.article_status.emit(delivery_item, i, "Найден")
+            for _source, source_index in additional_indexes:
+                source_matches = matcher.find_file_by_article_and_size(
+                    article, size, index_store_name,
+                    allowed_extensions=allowed_extensions,
+                    size_ranges=type_data.get("size_ranges", []),
+                    index=source_index,
+                    include_override=False,
+                )
+                if source_matches:
+                    match_groups.append(source_matches)
 
-                try:
-                    _, ext = os.path.splitext(os.path.basename(file))
-                    manual_override_path = get_override(
-                        store_name, supply_type, article, size
+            manual_matches = matcher.find_file_by_article_and_size(
+                article, size, index_store_name,
+                allowed_extensions=allowed_extensions,
+                size_ranges=type_data.get("size_ranges", []),
+                index={},
+                include_override=True,
+            )
+            if manual_matches:
+                match_groups.append(manual_matches)
+
+            if match_groups:
+                copied = False
+                last_error = None
+                for file in (
+                    candidate for group in match_groups for candidate in group
+                ):
+                    try:
+                        if self.cancel_token:
+                            self.cancel_token.raise_if_cancelled()
+                        _, ext = os.path.splitext(os.path.basename(file))
+                        manual_override_path = get_override(
+                            store_name, supply_type, article, size
+                        )
+                        base_name = _result_file_base_name(
+                            file, article, manual_override_path
+                        )
+                        if location == "СПИНА":
+                            suffix = f"[{size} СПИНА]" if size else "[СПИНА]"
+                        else:
+                            suffix = f"[{size}]" if size else ""
+
+                        if suffix:
+                            numbered_name = f"{i+1}. {base_name} {suffix}{ext}"
+                        else:
+                            numbered_name = f"{i+1}. {base_name}{ext}"
+
+                        target_path = os.path.abspath(
+                            os.path.join(output_folder, numbered_name)
+                        )
+                        output_root = os.path.abspath(output_folder)
+                        if os.path.commonpath([output_root, target_path]) != output_root:
+                            raise ValueError("Недопустимое имя итогового файла")
+                        copy_resource(
+                            file, target_path, cancel_token=self.cancel_token
+                        )
+                        self.signals.article_status.emit(
+                            delivery_item, i, "Найден"
+                        )
+                        self.signals.article_copied.emit(
+                            delivery_item, i, target_path
+                        )
+                        copied = True
+                        break
+                    except OperationCancelled:
+                        raise
+                    except Exception as error:
+                        last_error = error
+                        print(f"[ПОИСК] Ошибка копирования {file}: {error}")
+                        if isinstance(error, FileNotFoundError):
+                            remove_missing_path_from_index(index_store_name, file)
+
+                if not copied:
+                    not_found_items.append((i + 1, article, size, location))
+                    self.signals.article_status.emit(
+                        delivery_item, i, "Ошибка копирования"
                     )
-                    base_name = _result_file_base_name(
-                        file, article, manual_override_path
+                    print(
+                        f"[ПОИСК] Ни один найденный файл не скопирован для "
+                        f"{article}: {last_error}"
                     )
-                    if location == "СПИНА":
-                        suffix = f"[{size} СПИНА]" if size else "[СПИНА]"
-                    else:
-                        suffix = f"[{size}]" if size else ""
-
-                    if suffix:
-                        numbered_name = f"{i+1}. {base_name} {suffix}{ext}"
-                    else:
-                        numbered_name = f"{i+1}. {base_name}{ext}"
-
-                    target_path = os.path.abspath(
-                        os.path.join(output_folder, numbered_name)
-                    )
-                    output_root = os.path.abspath(output_folder)
-                    if os.path.commonpath([output_root, target_path]) != output_root:
-                        raise ValueError("Недопустимое имя итогового файла")
-                    copy_resource(file, target_path, cancel_token=self.cancel_token)
-                    self.signals.article_copied.emit(delivery_item, i, target_path)
-                except OperationCancelled:
-                    raise
-                except Exception as e:
-                    print(f"[ПОИСК] Ошибка копирования {file}: {e}")
             else:
                 not_found_items.append((i + 1, article, size, location))
                 self.signals.article_status.emit(delivery_item, i, "Не найден")
@@ -1332,8 +1436,9 @@ class MainWindow(QMainWindow):
                 "supply_type": supply_type,
                 "folder": delivery_item.folder,
                 "override_path": override_path,
-                "force": type_data.get("source", "local") != "yandex",
+                "force": False,
                 "source": type_data.get("source", "local"),
+                "additional_sources": type_data.get("additional_sources", []),
             }
         }
 
@@ -1364,7 +1469,16 @@ class MainWindow(QMainWindow):
                 f"[INDEX] {key}: повторный облачный поиск без индексации, "
                 "используется SQLite"
             )
-            self._on_restart_index_finished()
+            if any(
+                item.get("source", "local") != "yandex"
+                for item in type_data.get("additional_sources", [])
+            ):
+                worker = IndexRebuildWorker(unique_stores, self.shutdown_token)
+                worker.signals.finished.connect(self._on_restart_index_finished)
+                worker.signals.error.connect(self._on_index_error)
+                self.thread_pool.start(worker)
+            else:
+                self._on_restart_index_finished()
             return
 
         worker = IndexRebuildWorker(unique_stores, self.shutdown_token)
@@ -1446,6 +1560,17 @@ class MainWindow(QMainWindow):
                             f"[INDEX] {key}: облачный поиск без индексации, "
                             "используется сохранённый SQLite-индекс"
                         )
+                        unique_stores[key] = {
+                            "store_name": store_name,
+                            "supply_type": supply_type,
+                            "folder": cloud_path,
+                            "override_path": None,
+                            "source": source,
+                            "force": False,
+                            "additional_sources": type_data.get(
+                                "additional_sources", []
+                            ),
+                        }
                     continue
                 override_path = type_data.get("override_path") if type_data.get("copy_on_override") else None
 
@@ -1455,6 +1580,8 @@ class MainWindow(QMainWindow):
                     "folder": delivery_item.folder,
                     "override_path": override_path,
                     "source": source,
+                    "force": False,
+                    "additional_sources": type_data.get("additional_sources", []),
                 }
 
         if missing_cloud_indexes:
@@ -1529,7 +1656,12 @@ class MainWindow(QMainWindow):
         output_folder = os.path.join(base_output_folder, folder_name)
 
         delivery_item.output_folder = output_folder
-        self.tree_model.update_delivery_status(delivery_item, "Готово")
+        status = (
+            "Готово с предупреждением"
+            if getattr(delivery_item, "index_warning", False)
+            else "Готово"
+        )
+        self.tree_model.update_delivery_status(delivery_item, status)
 
     def _on_search_finished(self):
         if self._shutdown_started:

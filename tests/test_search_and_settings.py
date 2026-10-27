@@ -746,6 +746,139 @@ class MatcherSelectionTests(unittest.TestCase):
 
             matcher_factory.assert_called_once_with("Shop_WB", "Alekseev")
 
+
+class SearchCopyStatusTests(unittest.TestCase):
+    @staticmethod
+    def _delivery(directory):
+        child = SimpleNamespace(article="ART", size="M", location="")
+        return SimpleNamespace(
+            store_name="Shop",
+            supply_type="WB",
+            pdf_path=str(Path(directory) / "Delivery.pdf"),
+            display_store_name="Shop",
+            child_count=lambda: 1,
+            child=lambda _index: child,
+        )
+
+    def test_stale_first_match_is_removed_and_next_match_is_copied(self):
+        import gui.main_window as main_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing = str(Path(directory) / "missing.png")
+            available = Path(directory) / "available.png"
+            available.write_bytes(b"print")
+            matcher = Mock()
+            matcher.find_file_by_article_and_size.return_value = [
+                missing, str(available),
+            ]
+            statuses = []
+            copied = []
+            worker = SearchWorker([self._delivery(directory)], directory, {})
+            worker.signals.article_status.connect(
+                lambda _delivery, _row, status: statuses.append(status)
+            )
+            worker.signals.article_copied.connect(
+                lambda _delivery, _row, path: copied.append(path)
+            )
+            with patch.object(
+                main_module, "get_type_data",
+                return_value={"matcher": "Simple", "png_only": False},
+            ), patch.object(
+                main_module, "get_matcher_for_store", return_value=matcher,
+            ), patch.object(
+                main_module, "remove_missing_path_from_index"
+            ) as remove_stale:
+                worker._process_delivery(worker.delivery_items[0])
+
+            self.assertEqual(statuses, ["Найден"])
+            self.assertEqual(len(copied), 1)
+            self.assertEqual(Path(copied[0]).read_bytes(), b"print")
+            remove_stale.assert_called_once_with("Shop_WB", missing)
+
+    def test_copy_failure_is_reported_and_written_to_not_found(self):
+        import gui.main_window as main_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = str(Path(directory) / "blocked.png")
+            matcher = Mock()
+            matcher.find_file_by_article_and_size.return_value = [candidate]
+            statuses = []
+            worker = SearchWorker([self._delivery(directory)], directory, {})
+            worker.signals.article_status.connect(
+                lambda _delivery, _row, status: statuses.append(status)
+            )
+            with patch.object(
+                main_module, "get_type_data",
+                return_value={"matcher": "Simple", "png_only": False},
+            ), patch.object(
+                main_module, "get_matcher_for_store", return_value=matcher,
+            ), patch.object(
+                main_module, "copy_resource",
+                side_effect=PermissionError("blocked"),
+            ):
+                worker._process_delivery(worker.delivery_items[0])
+
+            self.assertEqual(statuses, ["Ошибка копирования"])
+            not_found = next(Path(directory).rglob("ненайденные.txt"))
+            self.assertEqual(not_found.read_text(encoding="utf-8"), "1.ART[M]\n")
+
+
+class StaleIndexPathTests(unittest.TestCase):
+    def test_cloud_path_is_not_removed_after_transient_download_error(self):
+        import indexer as indexer_module
+
+        self.assertFalse(
+            indexer_module.remove_missing_path_from_index(
+                "Shop_WB", "yadisk:/Prints/ART.png"
+            )
+        )
+
+    def test_missing_local_path_is_removed_from_sqlite_and_cache(self):
+        import indexer as indexer_module
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            indexer_module, "INDEX_DIR", directory
+        ):
+            store = "Shop_WB"
+            stale = str(Path(directory) / "missing.png")
+            with indexer_module._connect() as connection:
+                with connection:
+                    connection.execute(
+                        "INSERT INTO store_state(store, schema_version, last_scan_ns) "
+                        "VALUES (?, ?, 0)",
+                        (store, indexer_module._SCHEMA_VERSION),
+                    )
+                    connection.execute(
+                        "INSERT INTO files(store, path, article, mtime_ns, size, priority) "
+                        "VALUES (?, ?, 'art', 0, 0, 1)",
+                        (store, stale),
+                    )
+            indexer_module.INDEX_CACHE[store] = {"art": [stale]}
+
+            self.assertTrue(
+                indexer_module.remove_missing_path_from_index(store, stale)
+            )
+            self.assertEqual(indexer_module.get_index_for_store(store), {})
+
+
+class NetworkPathDetectionTests(unittest.TestCase):
+    def test_yandex_folder_on_physical_volume_is_local(self):
+        import indexer as indexer_module
+
+        path = "/Volumes/Transcend/Rex files/YandexDisk/Prints"
+        with patch.object(indexer_module.sys, "platform", "darwin"):
+            self.assertFalse(indexer_module._is_network_path(path))
+
+    def test_webdav_named_volume_is_network(self):
+        import indexer as indexer_module
+
+        with patch.object(indexer_module.sys, "platform", "darwin"):
+            self.assertTrue(
+                indexer_module._is_network_path(
+                    "/Volumes/webdav.yandex.ru/Prints"
+                )
+            )
+
 class SettingsWindowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -861,6 +994,45 @@ class SettingsWindowTests(unittest.TestCase):
                 window._on_png_only_toggled("WB", True)
                 self.assertTrue(window.stores["Store 00"]["WB"]["png_only"])
                 self.assertFalse(window.stores["Store 00"]["OZON"]["png_only"])
+                self.assertTrue(save_mock.called)
+            finally:
+                window.close()
+                self.app.processEvents()
+
+    def test_additional_sources_are_saved_in_order_for_selected_type(self):
+        import gui.settings_window as settings_module
+
+        stores = self._stores(count=1)
+        stores["Store 00"]["WB"]["path"] = "/main"
+        selected = [
+            {"source": "local", "path": "/extra-b"},
+            {"source": "yandex", "path": "disk:/extra-a"},
+        ]
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            settings_module, "load_stores", return_value=stores
+        ), patch.object(
+            settings_module, "get_data_path",
+            side_effect=lambda name: str(Path(directory) / name),
+        ), patch.object(
+            settings_module, "OVERRIDES_FILE", str(Path(directory) / "overrides.json")
+        ), patch.object(settings_module, "save_stores") as save_mock, patch.object(
+            settings_module, "AdditionalSourcesDialog",
+            return_value=SimpleNamespace(
+                sources=selected,
+                exec=lambda: settings_module.QDialog.Accepted,
+            ),
+        ):
+            window = settings_module.SettingsWindow()
+            try:
+                window._edit_additional_sources("WB")
+                self.assertEqual(
+                    window.stores["Store 00"]["WB"]["additional_sources"],
+                    selected,
+                )
+                self.assertEqual(
+                    window.stores["Store 00"]["OZON"].get("additional_sources", []),
+                    [],
+                )
                 self.assertTrue(save_mock.called)
             finally:
                 window.close()

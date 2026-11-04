@@ -3,7 +3,7 @@ import sys
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QFileDialog, QMessageBox, QGridLayout, QWidget,
-    QFrame
+    QFrame, QRadioButton
 )
 from PySide6.QtCore import Qt
 
@@ -114,6 +114,7 @@ class NewStoreDialog(QDialog):
         self.existing_store = existing_store
         self.existing_types = existing_types or []
         self.result = None
+        self.stores = load_stores()
 
         self.pdf_text = get_pdf_text(pdf_path)
 
@@ -141,10 +142,19 @@ class NewStoreDialog(QDialog):
         else:
             title_text = "Обнаружен новый магазин"
 
-        title_label = QLabel(title_text)
-        title_label.setWordWrap(True)
-        title_label.setStyleSheet("font-weight: 600; font-size: 14px; margin-bottom: 8px;")
-        layout.addWidget(title_label)
+        self.title_label = QLabel(title_text)
+        self.title_label.setWordWrap(True)
+        self.title_label.setStyleSheet("font-weight: 600; font-size: 14px; margin-bottom: 8px;")
+        layout.addWidget(self.title_label)
+
+        mode_layout = QHBoxLayout()
+        self.create_mode = QRadioButton("Создать новый магазин")
+        self.profile_mode = QRadioButton("Использовать существующий профиль")
+        self.profile_mode.setEnabled(bool(self.stores))
+        mode_layout.addWidget(self.create_mode)
+        mode_layout.addWidget(self.profile_mode)
+        mode_layout.addStretch()
+        layout.addLayout(mode_layout)
 
         # Форма
         form_layout = QGridLayout()
@@ -248,13 +258,49 @@ class NewStoreDialog(QDialog):
 
         layout.addLayout(form_layout)
 
+        self.create_widgets = [
+            store_label, self.store_name_input, type_label, self.type_combo,
+            source_label, self.source_combo, self.folder_label,
+            self.folder_input, self.browse_button,
+        ]
+
+        self.profile_container = QFrame()
+        profile_layout = QGridLayout(self.profile_container)
+        profile_layout.setContentsMargins(0, 0, 0, 0)
+        profile_layout.setSpacing(10)
+        profile_layout.addWidget(QLabel("Профиль магазина:"), 0, 0)
+        self.profile_store_combo = QComboBox()
+        self.profile_store_combo.addItems(sorted(self.stores, key=str.casefold))
+        self.profile_store_combo.setStyleSheet(COMBOBOX_STYLE)
+        self.profile_store_combo.setFrame(False)
+        profile_layout.addWidget(self.profile_store_combo, 0, 1)
+        profile_layout.addWidget(QLabel("Тип профиля:"), 1, 0)
+        self.profile_type_combo = QComboBox()
+        self.profile_type_combo.setStyleSheet(COMBOBOX_STYLE)
+        self.profile_type_combo.setFrame(False)
+        profile_layout.addWidget(self.profile_type_combo, 1, 1)
+        self.profile_info = QLabel()
+        self.profile_info.setWordWrap(True)
+        self.profile_info.setStyleSheet("color: #757575; font-size: 11px;")
+        profile_layout.addWidget(self.profile_info, 2, 0, 1, 2)
+        layout.addWidget(self.profile_container)
+
+        self.profile_store_combo.currentTextChanged.connect(
+            self._refresh_profile_types
+        )
+        self.profile_type_combo.currentTextChanged.connect(
+            self._refresh_profile_info
+        )
+
         # Информация о существующих типах
         if self.existing_store and self.existing_types:
-            info_label = QLabel(
+            self.existing_info_label = QLabel(
                 f"Уже добавленные типы: {', '.join(self.existing_types)}"
             )
-            info_label.setStyleSheet("color: #757575; font-size: 11px; margin-top: 8px;")
-            layout.addWidget(info_label)
+            self.existing_info_label.setStyleSheet("color: #757575; font-size: 11px; margin-top: 8px;")
+            layout.addWidget(self.existing_info_label)
+        else:
+            self.existing_info_label = None
 
         # Разделитель
         line = QFrame()
@@ -307,6 +353,63 @@ class NewStoreDialog(QDialog):
 
         layout.addLayout(button_layout)
 
+        self.create_mode.toggled.connect(self._on_mode_changed)
+        if self.store_name == "UNKNOWN" and self.stores:
+            self.profile_mode.setChecked(True)
+        else:
+            self.create_mode.setChecked(True)
+        if self.store_name in self.stores:
+            self.profile_store_combo.setCurrentText(self.store_name)
+        self._refresh_profile_types(self.profile_store_combo.currentText())
+        self._on_mode_changed()
+
+    def _on_mode_changed(self, *_):
+        temporary = self.profile_mode.isChecked()
+        for widget in self.create_widgets:
+            widget.setVisible(not temporary)
+        self.profile_container.setVisible(temporary)
+        if self.existing_info_label:
+            self.existing_info_label.setVisible(not temporary)
+        self.save_button.setText("Использовать" if temporary else "Сохранить")
+        self.title_label.setText(
+            "Выберите существующий профиль для текущего PDF"
+            if temporary else (
+                f"Магазин '{self.store_name}' уже существует.\n"
+                "Добавьте путь для нового типа поставки."
+                if self.existing_store else "Обнаружен новый магазин"
+            )
+        )
+
+    def _refresh_profile_types(self, store_name):
+        current = self.profile_type_combo.currentText()
+        self.profile_type_combo.blockSignals(True)
+        self.profile_type_combo.clear()
+        store_data = self.stores.get(store_name, {})
+        available = [
+            value for value in ("WB", "OZON") if value in store_data
+        ]
+        self.profile_type_combo.addItems(available)
+        preferred = self.supply_type if self.supply_type in available else current
+        if preferred in available:
+            self.profile_type_combo.setCurrentText(preferred)
+        self.profile_type_combo.blockSignals(False)
+        self._refresh_profile_info()
+
+    def _refresh_profile_info(self, *_):
+        store_name = self.profile_store_combo.currentText()
+        supply_type = self.profile_type_combo.currentText()
+        data = self.stores.get(store_name, {}).get(supply_type, {})
+        if not data:
+            self.profile_info.setText("У выбранного профиля нет доступного типа.")
+            return
+        source = (
+            "Яндекс REST API" if data.get("source") == "yandex"
+            else "Локальная или подключённая сетевая папка"
+        )
+        self.profile_info.setText(
+            f"Источник: {source}\nПапка: {data.get('path', '')}"
+        )
+
     def on_type_changed(self, new_type):
         new_store = self.extract_store_by_type(new_type)
         self.store_name_input.setText(new_store)
@@ -346,6 +449,25 @@ class NewStoreDialog(QDialog):
             self.folder_input.setText(folder)
 
     def save(self):
+        if self.profile_mode.isChecked():
+            store_name = self.profile_store_combo.currentText()
+            supply_type = self.profile_type_combo.currentText()
+            type_data = self.stores.get(store_name, {}).get(supply_type)
+            if not type_data:
+                QMessageBox.warning(
+                    self, "Ошибка", "Выберите магазин и тип существующего профиля"
+                )
+                return
+            self.result = {
+                "store_name": store_name,
+                "supply_type": supply_type,
+                "folder": type_data.get("path", ""),
+                "source": type_data.get("source", "local"),
+                "temporary_profile": True,
+            }
+            self.accept()
+            return
+
         store_name = self.store_name_input.text().strip()
         supply_type = self.type_combo.currentText()
         source = self.source_combo.currentData()
@@ -386,6 +508,7 @@ class NewStoreDialog(QDialog):
             "source": source,
             "png_only": False,
             "size_ranges": [],
+            "additional_sources": [],
         }
 
         save_stores(stores)

@@ -822,6 +822,32 @@ class SearchCopyStatusTests(unittest.TestCase):
             not_found = next(Path(directory).rglob("ненайденные.txt"))
             self.assertEqual(not_found.read_text(encoding="utf-8"), "1.ART[M]\n")
 
+    def test_exhausted_webdav_copy_has_distinct_status(self):
+        import gui.main_window as main_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            matcher = Mock()
+            matcher.find_file_by_article_and_size.return_value = [
+                "/Volumes/cloud/ART.png"
+            ]
+            statuses = []
+            worker = SearchWorker([self._delivery(directory)], directory, {})
+            worker.signals.article_status.connect(
+                lambda _delivery, _row, status: statuses.append(status)
+            )
+            with patch.object(
+                main_module, "get_type_data",
+                return_value={"matcher": "Simple", "png_only": False},
+            ), patch.object(
+                main_module, "get_matcher_for_store", return_value=matcher,
+            ), patch.object(
+                main_module, "copy_resource",
+                side_effect=main_module.NetworkReadError("offline"),
+            ):
+                worker._process_delivery(worker.delivery_items[0])
+
+            self.assertEqual(statuses, ["Ошибка WebDAV"])
+
 
 class StaleIndexPathTests(unittest.TestCase):
     def test_cloud_path_is_not_removed_after_transient_download_error(self):

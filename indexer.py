@@ -4,12 +4,13 @@ import hashlib
 import os
 import sqlite3
 from core.text_normalization import normalize_article
-import sys
+import sys  # Compatibility for existing platform-detection tests/callers.
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from core.paths import get_data_dir
+from core.network_paths import is_network_path, network_operation
 from core.yandex_disk import (
     YandexDiskClient, is_yandex_uri, normalise_disk_path, to_yandex_uri,
 )
@@ -256,31 +257,7 @@ def _roots(folder_path: str, override_path: str = None) -> list[dict]:
     return roots
 
 
-def _is_network_path(path: str) -> bool:
-    """Определяет распространённые сетевые пути без обращения к их содержимому."""
-    normalised = _normalise_path(path)
-    if normalised.startswith(("//", "\\\\")):
-        return True
-
-    lowered = normalised.casefold()
-    if sys.platform == "darwin" and normalised.startswith("/Volumes/"):
-        # Проверяем только имя подключённого тома. Обычная папка YandexDisk
-        # внутри физического диска (например /Volumes/Transcend/...) остаётся
-        # локальным источником и должна автоматически переиндексироваться.
-        volume_name = normalised[len("/Volumes/"):].split("/", 1)[0].casefold()
-        return any(
-            marker in volume_name for marker in ("webdav", "yandex", "dav")
-        )
-
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            drive = os.path.splitdrive(normalised)[0] + "\\"
-            return bool(drive.strip("\\")) and ctypes.windll.kernel32.GetDriveTypeW(drive) == 4
-        except (AttributeError, OSError):
-            return False
-    return False
+_is_network_path = is_network_path
 
 
 def _scan_files(roots: list[dict], progress_callback=None, cancel_token=None) -> dict:
@@ -433,33 +410,70 @@ def _load_source_state(connection, source_key: str):
     return state, files, directories
 
 
-def _scan_local_source_full(root_path, progress_callback=None, cancel_token=None):
+def _scan_local_source_full(
+    root_path, progress_callback=None, cancel_token=None, network=False,
+):
     files = {}
     directories = {}
     folder_number = 0
+
+    def read_entries(folder_path):
+        attempts = _NETWORK_SCAN_RETRIES if network else 1
+        last_error = None
+        for attempt in range(attempts):
+            try:
+                with os.scandir(folder_path) as iterator:
+                    return list(iterator)
+            except OSError as error:
+                last_error = error
+                if not network or attempt + 1 >= attempts:
+                    break
+                delay = 2 ** attempt
+                print(
+                    f"[WEBDAV] Не удалось прочитать каталог {folder_path}: "
+                    f"попытка {attempt + 1}/{attempts}, повтор через {delay} с "
+                    f"({error})"
+                )
+                time.sleep(delay)
+        if network:
+            raise NetworkScanError(
+                f"WebDAV оборвал перечисление каталога после {attempts} "
+                f"попыток: {folder_path} ({last_error})"
+            ) from last_error
+        raise last_error
 
     def walk(folder_path, parent_path=None):
         nonlocal folder_number
         if cancel_token:
             cancel_token.raise_if_cancelled()
-        stat = os.stat(folder_path, follow_symlinks=False)
+        mtime_ns = 0 if network else os.stat(
+            folder_path, follow_symlinks=False
+        ).st_mtime_ns
         directories[folder_path] = {
             "parent": parent_path,
-            "mtime_ns": stat.st_mtime_ns,
+            "mtime_ns": mtime_ns,
         }
         folder_number += 1
         if progress_callback:
             progress_callback(folder_path, folder_number, len(files))
-        with os.scandir(folder_path) as iterator:
-            entries = list(iterator)
+        entries = read_entries(folder_path)
         for entry in entries:
             if cancel_token:
                 cancel_token.raise_if_cancelled()
             try:
+                extension = os.path.splitext(entry.name)[1].lower()
+                if network and extension in _SUPPORTED_EXTENSIONS:
+                    path = _normalise_path(entry.path)
+                    files[path] = {
+                        "article": normalize_article(
+                            os.path.splitext(entry.name)[0]
+                        ),
+                        "directory": folder_path,
+                    }
+                    continue
                 if entry.is_dir(follow_symlinks=False):
                     walk(_normalise_path(entry.path), folder_path)
                     continue
-                extension = os.path.splitext(entry.name)[1].lower()
                 if extension not in _SUPPORTED_EXTENSIONS:
                     continue
                 if not entry.is_file(follow_symlinks=False):
@@ -613,28 +627,40 @@ def update_source_index(
         state, previous_files, previous_directories = _load_source_state(
             connection, spec["key"]
         )
-    if _is_network_path(spec["path"]) and state and not force_full:
+    network = _is_network_path(spec["path"])
+    if network and state and not force_full:
         get_index_for_source(spec["source"], spec["path"])
         print(f"[INDEX] Общий сетевой индекс используется без обхода: {spec['path']}")
         return False
-    if not os.path.isdir(spec["path"]):
+    with network_operation(spec["path"]):
+        source_available = os.path.isdir(spec["path"])
+    if not source_available:
         if state:
-            print(f"[INDEX] Источник временно недоступен, сохранён индекс: {spec['path']}")
+            if network and force_full:
+                raise NetworkScanError(
+                    f"WebDAV-источник недоступен; прежний индекс сохранён: "
+                    f"{spec['path']}"
+                )
+            print(
+                f"[INDEX] Источник временно недоступен, сохранён индекс: "
+                f"{spec['path']}"
+            )
             return False
         raise FileNotFoundError(spec["path"])
 
     snapshot_ready = bool(state and state[4])
-    if force_full or not snapshot_ready:
-        new_files, new_directories, checked, reused = _scan_local_source_full(
-            spec["path"], progress_callback, cancel_token
-        )
-        mode = "полная проверка"
-    else:
-        new_files, new_directories, checked, reused = _scan_local_source_incremental(
-            spec["path"], previous_files, previous_directories,
-            progress_callback, cancel_token,
-        )
-        mode = "быстрая проверка"
+    with network_operation(spec["path"]):
+        if force_full or not snapshot_ready:
+            new_files, new_directories, checked, reused = _scan_local_source_full(
+                spec["path"], progress_callback, cancel_token, network=network,
+            )
+            mode = "полная проверка WebDAV" if network else "полная проверка"
+        else:
+            new_files, new_directories, checked, reused = _scan_local_source_incremental(
+                spec["path"], previous_files, previous_directories,
+                progress_callback, cancel_token,
+            )
+            mode = "быстрая проверка"
 
     removed = set(previous_files) - set(new_files)
     added = set(new_files) - set(previous_files)

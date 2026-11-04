@@ -28,7 +28,8 @@ from gui.widgets.override_delegate import OverrideButtonDelegate
 from gui.dialogs.parse_progress_dialog import ParseProgressDialog
 from gui.dialogs.yandex_disk_picker import YandexDiskPickerDialog
 from core.store_manager import load_stores, save_stores, get_type_data
-from core.storage_backend import copy_resource
+from core.storage_backend import NetworkReadError, copy_resource
+from core.network_paths import is_network_path
 from parser import parse_wb_supply
 from ozon_parser import parse_ozon_supply
 from supply_detector import detect_supply_type
@@ -608,7 +609,10 @@ class SearchWorker(QRunnable):
                 if not copied:
                     not_found_items.append((i + 1, article, size, location))
                     self.signals.article_status.emit(
-                        delivery_item, i, "Ошибка копирования"
+                        delivery_item, i,
+                        "Ошибка WebDAV"
+                        if isinstance(last_error, NetworkReadError)
+                        else "Ошибка копирования",
                     )
                     print(
                         f"[ПОИСК] Ни один найденный файл не скопирован для "
@@ -1282,8 +1286,10 @@ class MainWindow(QMainWindow):
         # Проверяем: находится ли файл внутри target_root (или его подпапок)
         # Используем разделитель для точного совпадения префикса
         is_in_root = (
-            file_norm == root_norm or
-            file_norm.startswith(root_norm + os.sep)
+            not is_network_path(file_path) and (
+                file_norm == root_norm or
+                file_norm.startswith(root_norm + os.sep)
+            )
         )
 
         _, ext = os.path.splitext(file_path)
@@ -1365,7 +1371,9 @@ class MainWindow(QMainWindow):
                         return
 
                 # Копируем
-                shutil.copy2(file_path, new_path)
+                copy_resource(
+                    file_path, new_path, cancel_token=self.shutdown_token
+                )
                 print(f"[OVERRIDE] Скопирован: {file_path} → {new_path}")
                 QMessageBox.information(
                     self, "Успех",

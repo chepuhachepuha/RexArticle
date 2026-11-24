@@ -10,7 +10,6 @@ from PySide6.QtCore import Qt
 from supply_detector import detect_supply_type
 from core.store_manager import load_stores, save_stores
 from core.pdf_cache import get_pdf_text
-from gui.dialogs.yandex_disk_picker import YandexDiskPickerDialog
 
 
 # ============================================
@@ -108,7 +107,8 @@ COMBOBOX_STYLE = """
 class NewStoreDialog(QDialog):
     """Диалог для добавления нового магазина или нового типа поставки."""
 
-    def __init__(self, parent, pdf_path, existing_store=False, existing_types=None):
+    def __init__(self, parent, pdf_path=None, existing_store=False, existing_types=None,
+                 store_name=None, supply_type=None):
         super().__init__(parent)
         self.pdf_path = pdf_path
         self.existing_store = existing_store
@@ -116,9 +116,11 @@ class NewStoreDialog(QDialog):
         self.result = None
         self.stores = load_stores()
 
-        self.pdf_text = get_pdf_text(pdf_path)
+        self.pdf_text = get_pdf_text(pdf_path) if pdf_path else ""
 
-        initial = detect_supply_type(pdf_path)
+        initial = detect_supply_type(pdf_path) if pdf_path else {
+            "store_name": store_name or "UNKNOWN", "supply_type": supply_type or "WB",
+        }
         self.store_name = initial["store_name"]
         self.supply_type = initial["supply_type"]
 
@@ -207,9 +209,7 @@ class NewStoreDialog(QDialog):
         form_layout.addWidget(source_label, 2, 0)
 
         self.source_combo = QComboBox()
-        self.source_combo.addItem("Локально", "local")
-        if not sys.platform.startswith("win"):
-            self.source_combo.addItem("Яндекс Диск", "yandex")
+        self.source_combo.addItem("Локально или сетевая папка", "local")
         self.source_combo.setStyleSheet(COMBOBOX_STYLE)
         self.source_combo.setFrame(False)
         self.source_combo.currentIndexChanged.connect(self.on_source_changed)
@@ -402,10 +402,7 @@ class NewStoreDialog(QDialog):
         if not data:
             self.profile_info.setText("У выбранного профиля нет доступного типа.")
             return
-        source = (
-            "Яндекс REST API" if data.get("source") == "yandex"
-            else "Локальная или подключённая сетевая папка"
-        )
+        source = "Локальная или подключённая сетевая папка"
         self.profile_info.setText(
             f"Источник: {source}\nПапка: {data.get('path', '')}"
         )
@@ -415,10 +412,7 @@ class NewStoreDialog(QDialog):
         self.store_name_input.setText(new_store)
 
     def on_source_changed(self):
-        cloud = self.source_combo.currentData() == "yandex"
-        self.folder_label.setText(
-            "Папка на Яндекс Диске:" if cloud else "Папка с принтами:"
-        )
+        self.folder_label.setText("Папка с принтами:")
         self.folder_input.clear()
 
     def extract_store_by_type(self, supply_type):
@@ -438,13 +432,9 @@ class NewStoreDialog(QDialog):
         return "UNKNOWN"
 
     def choose_folder(self):
-        if self.source_combo.currentData() == "yandex":
-            picker = YandexDiskPickerDialog(parent=self)
-            folder = picker.selected_path if picker.exec() == QDialog.Accepted else ""
-        else:
-            folder = QFileDialog.getExistingDirectory(
-                self, "Выберите папку с принтами магазина"
-            )
+        folder = QFileDialog.getExistingDirectory(
+            self, "Выберите папку с принтами магазина"
+        )
         if folder:
             self.folder_input.setText(folder)
 

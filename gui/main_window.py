@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QDialog, QProgressDialog, QLineEdit, QDialogButtonBox,
 )
 from PySide6.QtCore import (
-    Qt, QDateTime, QTime, QUrl, QRunnable, QThreadPool, Signal, QObject, Slot,
+    Qt, QUrl, QRunnable, QThreadPool, Signal, QObject, Slot,
     QTimer, QStandardPaths,
 )
 from PySide6.QtGui import QAction, QDesktopServices
@@ -26,7 +26,7 @@ from gui.widgets.supply_tree import (
 )
 from gui.widgets.override_delegate import OverrideButtonDelegate
 from gui.dialogs.parse_progress_dialog import ParseProgressDialog
-from gui.dialogs.yandex_disk_picker import YandexDiskPickerDialog
+from gui.dialogs.load_supplies_dialog import LoadSuppliesDialog
 from core.store_manager import load_stores, save_stores, get_type_data
 from core.storage_backend import NetworkReadError, copy_resource
 from core.network_paths import is_network_path
@@ -36,16 +36,15 @@ from supply_detector import detect_supply_type
 from indexer import (
     get_index_for_source,
     has_source_index,
-    has_yandex_index_for_store,
     normalise_source,
     remove_missing_path_from_index,
     update_source_index,
     update_index_for_store,
-    update_yandex_indexes,
 )
 from matcher import get_matcher_for_store
 from manual_overrides import get_override, set_override, set_overrides
 from article_corrections import get_corrected_article, set_article_correction
+from core.trigu_api import TriguApiError, TriguClient
 
 
 # ============================================
@@ -352,73 +351,6 @@ class IndexRebuildWorker(QRunnable):
             self.signals.error.emit(str(e))
 
 
-class CloudAutoIndexSignals(QObject):
-    finished = Signal()
-
-
-class CloudAutoIndexWorker(QRunnable):
-    """По расписанию append-only обновляет подготовленные облачные индексы."""
-
-    def __init__(self, cancel_token=None):
-        super().__init__()
-        self.setAutoDelete(True)
-        self.signals = CloudAutoIndexSignals()
-        self.cancel_token = cancel_token
-
-    @Slot()
-    def run(self):
-        stores = load_stores()
-        print("[INDEX AUTO] Запущено фоновое append-only обновление облака")
-        tasks_by_source = {}
-        for store_name, store_data in stores.items():
-            for supply_type, type_data in store_data.items():
-                candidates = list(type_data.get("additional_sources", []))
-                if type_data.get("source", "local") == "yandex":
-                    candidates.insert(0, {
-                        "source": "yandex", "path": type_data.get("path", "")
-                    })
-                for source in candidates:
-                    if source.get("source") != "yandex":
-                        continue
-                    cloud_path = source.get("path", "").strip()
-                    if not cloud_path:
-                        continue
-                    spec = normalise_source("yandex", cloud_path)
-                    tasks_by_source.setdefault(spec["key"], {
-                        "key": f"source:{spec['key']}", "folder": cloud_path,
-                    })
-        total_cloud_indexes = len(tasks_by_source)
-        tasks = []
-        for task in tasks_by_source.values():
-            if not has_source_index("yandex", task["folder"]):
-                print(
-                    f"[INDEX AUTO] {task['folder']}: пропущен — сначала "
-                    "выполните ручную полную сверку"
-                )
-                continue
-            tasks.append(task)
-        try:
-            results = update_yandex_indexes(tasks, cancel_token=self.cancel_token)
-            changed_count = sum(bool(changed) for changed in results.values())
-            skipped_count = total_cloud_indexes - len(results)
-            print(
-                f"[INDEX AUTO] Обработано {len(results)} из "
-                f"{total_cloud_indexes} облачных индексов; "
-                f"новые файлы добавлены в {changed_count}; "
-                f"пропущено {skipped_count}"
-            )
-        except Exception as error:
-            # Фоновая ошибка не должна останавливать поиск или показывать
-            # навязчивое модальное окно пользователю.
-            print(f"[INDEX AUTO] Ошибка пакетного обновления: {error}")
-            print(
-                f"[INDEX AUTO] Обновление выполнено не полностью; "
-                f"запланировано индексов: {total_cloud_indexes}"
-            )
-        print("[INDEX AUTO] Фоновое обновление завершено")
-        self.signals.finished.emit()
-
-
 class SearchSignals(QObject):
     article_status = Signal(object, int, str)
     article_copied = Signal(object, int, str)
@@ -499,7 +431,11 @@ class SearchWorker(QRunnable):
             source_path = source.get("path", "").strip()
             if not source_path:
                 continue
-            if source_type != "yandex" and not os.path.isdir(source_path):
+            if source_type == "yandex":
+                delivery_item.index_warning = True
+                print(f"[ПОИСК] Источник Яндекс Диска отключён: {source_path}")
+                continue
+            if not os.path.isdir(source_path):
                 delivery_item.index_warning = True
                 print(
                     f"[ПОИСК] Дополнительный источник недоступен: {source_path}"
@@ -666,60 +602,8 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         self.setup_toolbar()
         self.setup_drag_drop()
-        self._cloud_auto_worker = None
+        # Compatibility for callers that used to stop the retired cloud timer.
         self.cloud_auto_timer = QTimer(self)
-        self.cloud_auto_timer.setSingleShot(True)
-        self.cloud_auto_timer.timeout.connect(self._start_cloud_auto_index)
-        self._schedule_next_cloud_auto_index()
-
-    def _schedule_next_cloud_auto_index(self):
-        """Планирует ежедневное обновление на выбранное пользователем время."""
-        self.cloud_auto_timer.stop()
-        if sys.platform.startswith("win"):
-            self.cloud_background_index_enabled = False
-            return
-        if not self.cloud_background_index_enabled:
-            print("[INDEX AUTO] Фоновое обновление облака отключено в настройках")
-            return
-
-        scheduled_time = QTime.fromString(
-            self.cloud_background_index_time, "HH:mm"
-        )
-        if not scheduled_time.isValid():
-            scheduled_time = QTime(3, 0)
-            self.cloud_background_index_time = "03:00"
-
-        now = QDateTime.currentDateTime()
-        next_run = QDateTime(now.date(), scheduled_time)
-        if next_run <= now:
-            next_run = next_run.addDays(1)
-        delay_ms = max(1000, int(now.msecsTo(next_run)))
-        self.cloud_auto_timer.start(delay_ms)
-        print(
-            "[INDEX AUTO] Следующее фоновое обновление облака: "
-            f"{next_run.toString('dd.MM.yyyy HH:mm')}"
-        )
-
-    def _start_cloud_auto_index(self):
-        if sys.platform.startswith("win") or self.shutdown_token.is_cancelled():
-            return
-        if not self.cloud_background_index_enabled:
-            return
-        if self.is_searching:
-            print("[INDEX AUTO] Поиск занят; обновление отложено на 15 минут")
-            self.cloud_auto_timer.start(self.CLOUD_AUTO_INDEX_RETRY_MS)
-            return
-        self._cloud_auto_worker = CloudAutoIndexWorker(self.shutdown_token)
-        self._cloud_auto_worker.signals.finished.connect(
-            self._on_cloud_auto_index_finished
-        )
-        self.thread_pool.start(self._cloud_auto_worker)
-
-    def _on_cloud_auto_index_finished(self):
-        self.matcher_cache.clear()
-        self._cloud_auto_worker = None
-        self._schedule_next_cloud_auto_index()
-
     # ============================================
     # Конфигурация
     # ============================================
@@ -737,14 +621,6 @@ class MainWindow(QMainWindow):
         token_removed = config.pop("yandex_oauth_token", None) is not None
         if token_removed and sys.platform.startswith("win"):
             atomic_write_json(self.config_file, config)
-        self.cloud_background_index_enabled = (
-            False if sys.platform.startswith("win") else bool(
-                config.get("cloud_background_index_enabled", True)
-            )
-        )
-        self.cloud_background_index_time = str(
-            config.get("cloud_background_index_time", "03:00")
-        )
         self.auto_expand_delivery = bool(
             config.get("personalization_auto_expand_delivery", True)
         )
@@ -778,8 +654,6 @@ class MainWindow(QMainWindow):
         config.update({
             "search_folder": "",
             "output_folder": self.output_folder,
-            "cloud_background_index_enabled": self.cloud_background_index_enabled,
-            "cloud_background_index_time": self.cloud_background_index_time,
             "personalization_auto_expand_delivery": self.auto_expand_delivery,
             "personalization_open_results_folder": self.open_results_folder,
             "personalization_append_store_to_delivery_folder": (
@@ -912,7 +786,7 @@ class MainWindow(QMainWindow):
             toolbar_layout.addWidget(button)
 
         self.load_action = QAction("📂 Загрузить", self)
-        self.load_action.triggered.connect(self.load_pdfs)
+        self.load_action.triggered.connect(self.load_supplies)
         add_action_button(self.load_action)
 
         self.run_action = QAction("▶️ Запустить", self)
@@ -989,12 +863,81 @@ class MainWindow(QMainWindow):
     # Загрузка PDF
     # ============================================
 
-    def load_pdfs(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Выберите PDF-файлы поставок", "", "PDF files (*.pdf)"
-        )
-        if files:
-            self.add_pdfs_to_table(files)
+    def load_supplies(self):
+        dialog = LoadSuppliesDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.local_files:
+            self.add_pdfs_to_table(dialog.local_files)
+        if dialog.selected_supplies:
+            self.add_trigu_supplies(dialog.selected_supplies)
+
+    @staticmethod
+    def _trigu_location(item):
+        name = str(item.get("name", "")).casefold()
+        return "СПИНА" if "принт на спине" in name else ""
+
+    def add_trigu_supplies(self, supplies):
+        """Fetch selected API deliveries and adapt them to the existing tree."""
+        stores = load_stores()
+        used_names = {
+            os.path.basename(item.pdf_path) for item in self.delivery_items
+        }
+        client = TriguClient()
+        for supply in supplies:
+            store_name = supply.shop or "UNKNOWN"
+            supply_type = supply.marketplace.upper()
+            type_data = stores.get(store_name, {}).get(supply_type, {})
+            if type_data.get("source") == "yandex":
+                QMessageBox.warning(
+                    self, "Источник недоступен",
+                    f"Для {store_name} ({supply_type}) сохранён устаревший источник Яндекс Диска. Выберите локальную или смонтированную папку."
+                )
+                type_data = {}
+            if not type_data:
+                from gui.dialogs.new_store_dialog import NewStoreDialog
+                dialog = NewStoreDialog(
+                    self, None, existing_store=bool(stores.get(store_name)),
+                    existing_types=list(stores.get(store_name, {}).keys()),
+                    store_name=store_name, supply_type=supply_type,
+                )
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    continue
+                store_name = dialog.result["store_name"]
+                supply_type = dialog.result["supply_type"]
+                type_data = get_type_data(store_name, supply_type)
+                stores = load_stores()
+            try:
+                items = client.get_supply_items(supply.number)
+            except TriguApiError as error:
+                QMessageBox.warning(self, "Trigu API", f"{supply.number}: {error}")
+                continue
+            delivery_name = supply.name or supply.number
+            if delivery_name in used_names:
+                delivery_name = f"{delivery_name} — {supply.number}"
+            used_names.add(delivery_name)
+            delivery = self.tree_model.add_delivery(
+                delivery_name, store_name, supply_type, type_data.get("path", ""),
+                self._display_store_name(store_name),
+            )
+            delivery.trigu_number = supply.number
+            articles, sizes, locations = [], [], []
+            for item in items:
+                quantity = max(1, int(item.get("quantity", 1) or 1))
+                for _ in range(quantity):
+                    articles.append(str(item.get("article", "")).strip())
+                    sizes.append(str(item.get("size", "")).strip() or "0")
+                    locations.append(self._trigu_location(item))
+            self.tree_model.add_articles(
+                delivery, articles, sizes, locations,
+                article_transform=lambda article: get_corrected_article(
+                    store_name, supply_type, article
+                ),
+            )
+            self.delivery_items.append(delivery)
+            self.tree_view.setExpanded(
+                self.tree_model.index(delivery.row(), 0), self.auto_expand_delivery
+            )
 
     def add_pdfs_to_table(self, pdf_paths):
         """Добавляет PDF с показом диалога прогресса."""
@@ -1219,26 +1162,9 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         type_data = get_type_data(store_name, supply_type)
         if type_data.get("source") == "yandex":
-            if sys.platform.startswith("win"):
-                QMessageBox.information(
-                    self, "Яндекс Диск недоступен",
-                    "Яндекс Диск временно недоступен в Windows-версии."
-                )
-                return
-            picker = YandexDiskPickerDialog(
-                select_file=True,
-                initial_path=type_data.get("path", ""),
-                parent=self,
-            )
-            if picker.exec() != QDialog.Accepted:
-                return
-            linked_count = self._remember_override_for_article(
-                delivery_item, article, picker.selected_path,
-                "Уточнён (Яндекс Диск)",
-            )
-            QMessageBox.information(
-                self, "Успех",
-                f"Облачный файл привязан к {linked_count} поз.",
+            QMessageBox.warning(
+                self, "Источник недоступен",
+                "REST-интеграция Яндекс Диска удалена. Выберите локальную или смонтированную папку в настройках.",
             )
             return
 
@@ -1453,40 +1379,13 @@ class MainWindow(QMainWindow):
         self._pending_restart_item = delivery_item
 
         if type_data.get("source", "local") == "yandex":
-            if sys.platform.startswith("win"):
-                self._pending_restart_item = None
-                self.is_searching = False
-                self._set_actions_enabled(True)
-                QMessageBox.information(
-                    self, "Яндекс Диск недоступен",
-                    "Для этого магазина выберите локальную или сетевую папку."
-                )
-                return
-            cloud_path = type_data.get("path", "").strip()
-            if not has_yandex_index_for_store(key, cloud_path):
-                self._pending_restart_item = None
-                self.is_searching = False
-                self._set_actions_enabled(True)
-                QMessageBox.warning(
-                    self, "Требуется индекс",
-                    "Для этого облачного магазина ещё нет готового индекса.\n\n"
-                    "Откройте настройки и выполните ручную полную сверку."
-                )
-                return
-            print(
-                f"[INDEX] {key}: повторный облачный поиск без индексации, "
-                "используется SQLite"
+            self._pending_restart_item = None
+            self.is_searching = False
+            self._set_actions_enabled(True)
+            QMessageBox.warning(
+                self, "Источник недоступен",
+                "REST-интеграция Яндекс Диска удалена. Выберите локальную или смонтированную папку в настройках.",
             )
-            if any(
-                item.get("source", "local") != "yandex"
-                for item in type_data.get("additional_sources", [])
-            ):
-                worker = IndexRebuildWorker(unique_stores, self.shutdown_token)
-                worker.signals.finished.connect(self._on_restart_index_finished)
-                worker.signals.error.connect(self._on_index_error)
-                self.thread_pool.start(worker)
-            else:
-                self._on_restart_index_finished()
             return
 
         worker = IndexRebuildWorker(unique_stores, self.shutdown_token)
@@ -1542,7 +1441,7 @@ class MainWindow(QMainWindow):
 
         unique_stores = {}
         processed_store_keys = set()
-        missing_cloud_indexes = []
+        unavailable_sources = []
         for delivery_item in self.delivery_items:
             store_name = delivery_item.store_name
             supply_type = delivery_item.supply_type
@@ -1553,32 +1452,7 @@ class MainWindow(QMainWindow):
                 type_data = get_type_data(store_name, supply_type)
                 source = type_data.get("source", "local")
                 if source == "yandex":
-                    if sys.platform.startswith("win"):
-                        missing_cloud_indexes.append(
-                            f"{store_name} ({supply_type}) — Яндекс Диск недоступен"
-                        )
-                        continue
-                    cloud_path = type_data.get("path", "").strip()
-                    if not has_yandex_index_for_store(key, cloud_path):
-                        missing_cloud_indexes.append(
-                            f"{store_name} ({supply_type})"
-                        )
-                    else:
-                        print(
-                            f"[INDEX] {key}: облачный поиск без индексации, "
-                            "используется сохранённый SQLite-индекс"
-                        )
-                        unique_stores[key] = {
-                            "store_name": store_name,
-                            "supply_type": supply_type,
-                            "folder": cloud_path,
-                            "override_path": None,
-                            "source": source,
-                            "force": False,
-                            "additional_sources": type_data.get(
-                                "additional_sources", []
-                            ),
-                        }
+                    unavailable_sources.append(f"{store_name} ({supply_type})")
                     continue
                 override_path = type_data.get("override_path") if type_data.get("copy_on_override") else None
 
@@ -1592,12 +1466,12 @@ class MainWindow(QMainWindow):
                     "additional_sources": type_data.get("additional_sources", []),
                 }
 
-        if missing_cloud_indexes:
+        if unavailable_sources:
             QMessageBox.warning(
-                self, "Требуется индекс",
-                "Для облачных магазинов не подготовлены индексы:\n\n"
-                + "\n".join(missing_cloud_indexes)
-                + "\n\nВ Windows-версии используйте локальную или сетевую папку."
+                self, "Источник недоступен",
+                "Для профилей ниже сохранён удалённый REST-источник Яндекс Диска:\n\n"
+                + "\n".join(unavailable_sources)
+                + "\n\nВыберите локальную или смонтированную папку в настройках."
             )
             return
 

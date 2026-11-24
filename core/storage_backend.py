@@ -4,7 +4,6 @@ import shutil
 import time
 
 from core.network_paths import is_network_path, network_operation
-from core.yandex_disk import YandexDiskClient, is_yandex_uri
 
 
 class NetworkReadError(OSError):
@@ -31,17 +30,10 @@ def _copy_local_file(
     os.replace(temporary, destination)
 
 
-def copy_resource(source: str, destination: str, *, yandex_client=None, cancel_token=None) -> str:
+def copy_resource(source: str, destination: str, *, cancel_token=None) -> str:
     """Copy/download a resource atomically, with cooperative cancellation."""
     if cancel_token:
         cancel_token.raise_if_cancelled()
-    if is_yandex_uri(source):
-        client = yandex_client or YandexDiskClient()
-        result = client.download_uri(source, destination)
-        if cancel_token:
-            cancel_token.raise_if_cancelled()
-        return result
-
     temporary = destination + ".part"
     source_network = is_network_path(source)
     destination_network = is_network_path(destination)

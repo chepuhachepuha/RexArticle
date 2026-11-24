@@ -12,10 +12,7 @@ from PySide6.QtWidgets import (
     QTabWidget, QTimeEdit, QTableWidget, QTableWidgetItem, QDialogButtonBox,
     QHeaderView, QListWidget
 )
-from PySide6.QtCore import (
-    Qt, QTime, QTimer, QObject, QRunnable, QThreadPool, Signal, Slot, QUrl,
-)
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import Qt, QTime, QTimer, QObject, QRunnable, QThreadPool, Signal, Slot
 
 from core.store_manager import (
     load_stores, normalise_additional_sources, prune_unused_indexes, save_stores,
@@ -28,14 +25,8 @@ from indexer import (
     remove_index_for_store,
     update_source_index,
     update_index_for_store,
-    update_yandex_indexes,
 )
-from core.yandex_disk import (
-    YandexDiskClient, YandexDiskError, build_authorization_url,
-    configure_yandex_token, delete_saved_yandex_token,
-    load_saved_yandex_token,
-)
-from gui.dialogs.yandex_disk_picker import YandexDiskPickerDialog
+from core.trigu_api import TriguApiError, TriguClient, load_api_key, save_api_key
 from matcher import get_matcher_options, resolve_matcher_name
 from core.text_normalization import normalize_article
 from core.ozon_sizes import (
@@ -212,44 +203,8 @@ class SettingsIndexWorker(QRunnable):
 
     def _run_full(self):
         total = len(self.tasks)
-        indexed_tasks = list(enumerate(self.tasks, start=1))
-        local_tasks = [
-            item for item in indexed_tasks if item[1].get("source") != "yandex"
-        ]
-        cloud_tasks = [
-            item for item in indexed_tasks if item[1].get("source") == "yandex"
-        ]
-
-        for position, task in local_tasks:
+        for position, task in enumerate(self.tasks, start=1):
             self._full_task(position, total, task)
-
-        def started(position, _total, task):
-            label = task["label"]
-            display_position = task.get("_display_position", position)
-            self.signals.store_started.emit(display_position, total, label)
-            print(f"[INDEX] Начало {display_position}/{total}: {label}")
-
-        def finished(position, _total, task):
-            label = task["label"]
-            display_position = task.get("_display_position", position)
-            self.signals.store_finished.emit(display_position, total, label)
-            print(f"[INDEX] Завершено {display_position}/{total}: {label}")
-
-        prepared_tasks = []
-        for display_position, task in cloud_tasks:
-            prepared = dict(task)
-            prepared["_display_position"] = display_position
-
-            def on_folder(path, folder_number, files_found):
-                self.signals.folder_scanned.emit(path, folder_number, files_found)
-
-            prepared["progress_callback"] = on_folder
-            prepared_tasks.append(prepared)
-        update_yandex_indexes(
-            prepared_tasks,
-            on_store_started=started,
-            on_store_finished=finished,
-        )
 
     @Slot()
     def run(self):
@@ -419,10 +374,6 @@ class AdditionalSourcesDialog(QDialog):
         local = QPushButton("Добавить локальную…")
         local.clicked.connect(self._add_local)
         add_row.addWidget(local)
-        cloud = QPushButton("Добавить Яндекс Диск…")
-        cloud.setEnabled(not sys.platform.startswith("win"))
-        cloud.clicked.connect(self._add_cloud)
-        add_row.addWidget(cloud)
         add_row.addStretch()
         layout.addLayout(add_row)
         actions = QHBoxLayout()
@@ -444,7 +395,7 @@ class AdditionalSourcesDialog(QDialog):
         self._refresh()
 
     def _label(self, source):
-        kind = "Яндекс Диск" if source.get("source") == "yandex" else "Локальная"
+        kind = "Недоступный Яндекс Диск" if source.get("source") == "yandex" else "Локальная"
         return f"{kind} · {source.get('path', '')}"
 
     def _refresh(self, selected=None):
@@ -478,11 +429,6 @@ class AdditionalSourcesDialog(QDialog):
         path = QFileDialog.getExistingDirectory(self, "Выберите папку с принтами")
         if path:
             self._append("local", path)
-
-    def _add_cloud(self):
-        picker = YandexDiskPickerDialog(parent=self)
-        if picker.exec() == QDialog.Accepted:
-            self._append("yandex", picker.selected_path)
 
     def _update_actions(self, *_):
         row = self.list.currentRow()
@@ -748,7 +694,7 @@ class SettingsWindow(QDialog):
         self.tabs.addTab(stores_tab, "Магазины")
         self.tabs.addTab(self._create_ozon_sizes_tab(), "Словарь размеров Ozon")
         self.tabs.addTab(self._create_personalization_tab(), "Персонализация")
-        self.tabs.addTab(self._create_yandex_tab(), "Яндекс Диск")
+        self.tabs.addTab(self._create_api_tab(), "API")
 
         self.refresh_store_buttons()
         self._clear_inline_styles()
@@ -1104,60 +1050,35 @@ class SettingsWindow(QDialog):
         except OSError as error:
             print(f"[SETTINGS] Не удалось сохранить персонализацию: {error}")
 
-    def _create_yandex_tab(self):
-        """Настройка интеграции с Яндекс Диском."""
+    def _create_api_tab(self):
+        """Настройка read-only интеграции Trigu."""
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(12)
-        title = QLabel("Яндекс Диск")
+        title = QLabel("Trigu API")
         title.setObjectName("settingsTitle")
         layout.addWidget(title)
 
-        if sys.platform.startswith("win"):
-            unavailable = QLabel(
-                "Яндекс Диск временно недоступен в Windows-версии.\n"
-                "Используйте локальную или сетевую папку Windows."
-            )
-            unavailable.setObjectName("unavailableNotice")
-            unavailable.setWordWrap(True)
-            layout.addWidget(unavailable)
-            layout.addStretch()
-            return tab
-
-        hint = QLabel(
-            "Подключите Яндекс Диск, чтобы выбирать облачные папки и искать принты."
-        )
+        hint = QLabel("Ключ выдаётся в Trigu: Настройки → Интеграция. Он используется только для чтения поставок.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
-        self.yandex_token_input = QLineEdit()
-        self.yandex_token_input.setPlaceholderText("OAuth-токен Яндекс Диска")
-        self.yandex_token_input.setEchoMode(QLineEdit.Password)
-        layout.addWidget(self.yandex_token_input)
+        self.trigu_key_input = QLineEdit()
+        self.trigu_key_input.setPlaceholderText("Ключ Trigu (trg_…)")
+        self.trigu_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addWidget(self.trigu_key_input)
         buttons = QHBoxLayout()
-        authorize = QPushButton("Получить токен")
-        authorize.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl(build_authorization_url()))
-        )
-        buttons.addWidget(authorize)
-        apply_token = QPushButton("Подключить")
-        apply_token.setProperty("accent", True)
-        apply_token.clicked.connect(self._apply_yandex_token)
-        buttons.addWidget(apply_token)
+        apply_key = QPushButton("Сохранить ключ")
+        apply_key.setProperty("accent", True)
+        apply_key.clicked.connect(self._apply_trigu_key)
+        buttons.addWidget(apply_key)
         check_connection = QPushButton("Проверить подключение")
-        check_connection.clicked.connect(self._check_yandex_connection)
+        check_connection.clicked.connect(self._check_trigu_connection)
         buttons.addWidget(check_connection)
-        delete_token = QPushButton("Удалить токен")
-        delete_token.setProperty("destructive", True)
-        delete_token.clicked.connect(self._delete_yandex_token)
-        buttons.addWidget(delete_token)
         buttons.addStretch()
         layout.addLayout(buttons)
-        self.yandex_status = QLabel(
-            "Сохранённый токен будет использован автоматически"
-            if load_saved_yandex_token() else "Не подключено"
-        )
-        layout.addWidget(self.yandex_status)
+        self.trigu_status = QLabel("Ключ сохранён" if load_api_key() else "Не подключено")
+        layout.addWidget(self.trigu_status)
         layout.addStretch()
         return tab
     def _load_app_config(self):
@@ -1188,41 +1109,30 @@ class SettingsWindow(QDialog):
         except OSError as error:
             print(f"[INDEX AUTO] Не удалось сохранить расписание: {error}")
 
-    def _apply_yandex_token(self):
-        token = self.yandex_token_input.text().strip()
-        if not token:
-            if load_saved_yandex_token():
-                self.yandex_status.setText("Используется сохранённый токен")
-                return True
-            self.yandex_status.setText("Введите OAuth-токен")
+    def _apply_trigu_key(self):
+        key = self.trigu_key_input.text().strip()
+        if not key:
+            self.trigu_status.setText("Введите ключ Trigu")
             return False
         try:
-            configure_yandex_token(token, persist=True)
-        except YandexDiskError as error:
-            self.yandex_status.setText(f"Токен применён, но не сохранён: {error}")
+            save_api_key(key)
+        except TriguApiError as error:
+            self.trigu_status.setText(str(error))
             return False
-        self.yandex_token_input.clear()
-        self.yandex_token_input.setPlaceholderText(
-            "Токен сохранён в config.json"
-        )
-        self.yandex_status.setText("Токен сохранён и применён")
+        self.trigu_key_input.clear()
+        self.trigu_key_input.setPlaceholderText("Ключ сохранён в config.json")
+        self.trigu_status.setText("Ключ сохранён")
         return True
 
-    def _check_yandex_connection(self):
-        if not self._apply_yandex_token():
+    def _check_trigu_connection(self):
+        if self.trigu_key_input.text().strip() and not self._apply_trigu_key():
             return
         try:
-            YandexDiskClient().list_directory("disk:/")
-        except YandexDiskError as error:
-            self.yandex_status.setText(f"Ошибка подключения: {error}")
+            TriguClient().check_connection()
+        except TriguApiError as error:
+            self.trigu_status.setText(f"Ошибка подключения: {error}")
         else:
-            self.yandex_status.setText("Подключение к Яндекс Диску установлено")
-
-    def _delete_yandex_token(self):
-        delete_saved_yandex_token()
-        self.yandex_token_input.clear()
-        self.yandex_token_input.setPlaceholderText("OAuth-токен Яндекс Диска")
-        self.yandex_status.setText("Сохранённый токен удалён")
+            self.trigu_status.setText("Подключение к Trigu установлено")
 
     def _clear_inline_styles(self):
         """Оставляет оформление глобальной системной теме, а не жёстким цветам."""
@@ -1437,12 +1347,11 @@ class SettingsWindow(QDialog):
         source_layout.addWidget(source_label)
         source_combo = QComboBox()
         source_combo.addItem("Локальная папка", "local")
-        if not sys.platform.startswith("win"):
-            source_combo.addItem("Яндекс Диск", "yandex")
-        elif vars_dict["source"] == "yandex":
+        if vars_dict["source"] == "yandex":
             source_combo.addItem("Яндекс Диск (недоступен)", "yandex")
-            source_combo.setEnabled(False)
-        source_combo.setCurrentIndex(0 if vars_dict["source"] == "local" else 1)
+            source_combo.setCurrentIndex(1)
+        else:
+            source_combo.setCurrentIndex(0)
         source_combo.currentIndexChanged.connect(
             lambda _index, st=supply_type, combo=source_combo: self._on_source_changed(
                 st, combo.currentData()
@@ -1778,13 +1687,7 @@ class SettingsWindow(QDialog):
 
     def browse_folder(self, supply_type):
         vars_dict = self.type_vars[self.selected_store][supply_type]
-        if vars_dict.get("source") == "yandex":
-            picker = YandexDiskPickerDialog(
-                initial_path=vars_dict.get("path", ""), parent=self
-            )
-            folder = picker.selected_path if picker.exec() == QDialog.Accepted else ""
-        else:
-            folder = QFileDialog.getExistingDirectory(self, "Выберите папку")
+        folder = QFileDialog.getExistingDirectory(self, "Выберите папку")
         if folder:
             store_name = self.selected_store
             self.type_vars[store_name][supply_type]["path"] = folder
@@ -1793,13 +1696,7 @@ class SettingsWindow(QDialog):
 
     def browse_override_path(self, supply_type):
         vars_dict = self.type_vars[self.selected_store][supply_type]
-        if vars_dict.get("source") == "yandex":
-            picker = YandexDiskPickerDialog(
-                initial_path=vars_dict.get("override_path", ""), parent=self
-            )
-            folder = picker.selected_path if picker.exec() == QDialog.Accepted else ""
-        else:
-            folder = QFileDialog.getExistingDirectory(self, "Выберите папку")
+        folder = QFileDialog.getExistingDirectory(self, "Выберите папку")
         if folder:
             store_name = self.selected_store
             self.type_vars[store_name][supply_type]["override_path"] = folder
@@ -1984,7 +1881,7 @@ class SettingsWindow(QDialog):
         for store_name in store_names:
             store_data = self.stores.get(store_name, {})
             for supply_type, type_data in store_data.items():
-                if sys.platform.startswith("win") and type_data.get("source") == "yandex":
+                if type_data.get("source") == "yandex":
                     print(f"[INDEX] Пропущен {store_name} ({supply_type}): Яндекс Диск недоступен")
                     continue
                 primary = type_data.get("path", "").strip()

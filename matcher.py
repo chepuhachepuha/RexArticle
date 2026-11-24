@@ -4,7 +4,6 @@ import re
 from manual_overrides import get_override
 from indexer import get_index_for_store
 from core.paths import resource_path
-from core.yandex_disk import is_yandex_uri
 from core.text_normalization import normalize_article
 from core.store_manager import KRISTABELL_SIZE_RANGES
 
@@ -58,9 +57,7 @@ class BaseMatcher:
             if len(parts) == 2:
                 actual_store, supply_type = parts
                 override_path = get_override(actual_store, supply_type, article, size_from_pdf)
-                if override_path and (
-                    is_yandex_uri(override_path) or os.path.exists(override_path)
-                ):
+                if override_path and os.path.exists(override_path):
                     return override_path
         return None
 

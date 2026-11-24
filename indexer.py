@@ -1,4 +1,5 @@
 """Инкрементальная индексация файлов принтов в SQLite."""
+from __future__ import annotations
 import json
 import hashlib
 import os
@@ -11,9 +12,11 @@ from datetime import datetime
 
 from core.paths import get_data_dir
 from core.network_paths import is_network_path, network_operation
-from core.yandex_disk import (
-    YandexDiskClient, is_yandex_uri, normalise_disk_path, to_yandex_uri,
-)
+
+
+def is_yandex_uri(path: str) -> bool:
+    """Recognise legacy settings so they can be reported as unavailable."""
+    return str(path or "").casefold().startswith(("disk:", "yadisk:"))
 
 
 INDEX_DIR = os.path.join(get_data_dir(), "index")
@@ -165,7 +168,8 @@ def _normalise_path(path: str) -> str:
 
 def normalise_source(source_type: str, path: str) -> dict:
     kind = "yandex" if source_type == "yandex" else "local"
-    root = to_yandex_uri(path) if kind == "yandex" else _normalise_path(path)
+    # Legacy cloud records remain identifiable but are no longer fetched.
+    root = str(path or "").strip() if kind == "yandex" else _normalise_path(path)
     identity = f"{kind}\0{root.casefold()}".encode("utf-8")
     return {
         "source": kind,

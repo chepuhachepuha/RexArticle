@@ -72,6 +72,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $version = $env:RELEASE_TAG.TrimStart('v')
           python -m PyInstaller --noconfirm --clean RexArticles.Windows.spec
           choco install innosetup --no-progress -y

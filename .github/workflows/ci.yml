@@ -55,6 +55,7 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           python -m PyInstaller --noconfirm --clean RexArticles.Windows.spec
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.0.0-ci RexArticles.iss
           if (!(Test-Path "release_windows\RexArticles-Setup-v0.0.0-ci.exe")) { throw "Windows installer was not created" }

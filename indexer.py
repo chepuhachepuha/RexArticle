@@ -211,8 +211,12 @@ def _ensure_shared_migration(connection: sqlite3.Connection):
     ).fetchone()[0]
     backup_path = _get_db_path() + ".v3-backup"
     if legacy_count and os.path.exists(_get_db_path()) and not os.path.exists(backup_path):
-        with sqlite3.connect(backup_path) as backup:
-            connection.backup(backup)
+        backup = sqlite3.connect(backup_path)
+        try:
+            with backup:
+                connection.backup(backup)
+        finally:
+            backup.close()
         print(f"[INDEX] Создана резервная копия SQLite v3: {backup_path}")
 
     roots_by_store = {}

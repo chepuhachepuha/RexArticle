@@ -44,7 +44,10 @@ from indexer import (
 from matcher import get_matcher_for_store
 from manual_overrides import get_override, set_override, set_overrides
 from article_corrections import get_corrected_article, set_article_correction
-from core.trigu_api import TriguApiError, TriguClient
+from core.trigu_api import (
+    TriguApiError, TriguClient, load_category_order,
+    load_marketplace_order, register_categories,
+)
 
 
 # ============================================
@@ -636,6 +639,8 @@ class MainWindow(QMainWindow):
         self.store_display_names = dict(
             config.get("store_display_names", {}) or {}
         )
+        self.trigu_marketplace_order = load_marketplace_order()
+        self.trigu_category_order = load_category_order()
         if (
             not os.path.exists(self.config_file)
             or configured_output_folder != self.output_folder
@@ -872,10 +877,45 @@ class MainWindow(QMainWindow):
         if dialog.selected_supplies:
             self.add_trigu_supplies(dialog.selected_supplies)
 
+    def _sort_delivery_items(self):
+        rank = {
+            value: index
+            for index, value in enumerate(self.trigu_marketplace_order)
+        }
+        self.delivery_items.sort(
+            key=lambda item: rank.get(
+                str(item.supply_type or "").upper(), len(rank)
+            )
+        )
+        self.tree_model.reorder_deliveries(self.trigu_marketplace_order)
+
     @staticmethod
     def _trigu_location(item):
         name = str(item.get("name", "")).casefold()
         return "СПИНА" if "принт на спине" in name else ""
+
+    @staticmethod
+    def _sort_trigu_items(items, category_order):
+        category_rank = {
+            category.casefold(): index
+            for index, category in enumerate(category_order)
+        }
+        indexed_items = list(enumerate(items))
+
+        def category_sort_key(pair):
+            category = str(
+                pair[1].get("category", "") or ""
+            ).strip().casefold()
+            if not category:
+                return (len(category_rank) + 1, "", pair[0])
+            return (
+                category_rank.get(category, len(category_rank)),
+                category,
+                pair[0],
+            )
+
+        indexed_items.sort(key=category_sort_key)
+        return [item for _original_index, item in indexed_items]
 
     def add_trigu_supplies(self, supplies):
         """Fetch selected API deliveries and adapt them to the existing tree."""
@@ -884,6 +924,7 @@ class MainWindow(QMainWindow):
             os.path.basename(item.pdf_path) for item in self.delivery_items
         }
         client = TriguClient()
+        prepared = []
         for supply in supplies:
             store_name = supply.shop or "UNKNOWN"
             supply_type = supply.marketplace.upper()
@@ -912,6 +953,20 @@ class MainWindow(QMainWindow):
             except TriguApiError as error:
                 QMessageBox.warning(self, "Trigu API", f"{supply.number}: {error}")
                 continue
+            prepared.append((supply, store_name, supply_type, type_data, items))
+
+        categories = {
+            str(item.get("category", "") or "").strip()
+            for _supply, _store, _type, _data, items in prepared
+            for item in items
+            if str(item.get("category", "") or "").strip()
+        }
+        try:
+            self.trigu_category_order = register_categories(categories)
+        except OSError as error:
+            print(f"[TRIGU] Не удалось сохранить категории: {error}")
+        added_deliveries = []
+        for supply, store_name, supply_type, type_data, items in prepared:
             delivery_name = supply.name or supply.number
             if delivery_name in used_names:
                 delivery_name = f"{delivery_name} — {supply.number}"
@@ -922,7 +977,10 @@ class MainWindow(QMainWindow):
             )
             delivery.trigu_number = supply.number
             articles, sizes, locations = [], [], []
-            for item in items:
+            sorted_items = self._sort_trigu_items(
+                items, self.trigu_category_order
+            )
+            for item in sorted_items:
                 quantity = max(1, int(item.get("quantity", 1) or 1))
                 for _ in range(quantity):
                     articles.append(str(item.get("article", "")).strip())
@@ -935,6 +993,10 @@ class MainWindow(QMainWindow):
                 ),
             )
             self.delivery_items.append(delivery)
+            added_deliveries.append(delivery)
+
+        self._sort_delivery_items()
+        for delivery in added_deliveries:
             self.tree_view.setExpanded(
                 self.tree_model.index(delivery.row(), 0), self.auto_expand_delivery
             )
@@ -1004,6 +1066,7 @@ class MainWindow(QMainWindow):
 
             QApplication.processEvents()
 
+        self._sort_delivery_items()
         if not workers_to_start:
             return
 
@@ -1580,7 +1643,7 @@ class MainWindow(QMainWindow):
             self.matcher_cache.clear()
         self.load_config()
         self.tree_model.refresh_store_display_names(self.store_display_names)
-        self._schedule_next_cloud_auto_index()
+        self._sort_delivery_items()
 
     def _finish_windows_shutdown(self):
         if self._shutdown_poll_timer:

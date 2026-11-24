@@ -228,6 +228,20 @@ class SupplyTreeModel(QAbstractItemModel):
         self.endInsertRows()
         return delivery_item
 
+    def reorder_deliveries(self, marketplace_order):
+        """Group root deliveries by marketplace without recreating items."""
+        rank = {
+            str(value).upper(): index
+            for index, value in enumerate(marketplace_order or [])
+        }
+        self.beginResetModel()
+        self.root_item.child_items.sort(
+            key=lambda item: rank.get(
+                str(item.supply_type or "").upper(), len(rank)
+            )
+        )
+        self.endResetModel()
+
     def add_articles(self, delivery_item, articles, sizes, locations, article_transform=None):
         """Добавляет артикулы к поставке."""
         delivery_index = self.createIndex(delivery_item.row(), 0, delivery_item)

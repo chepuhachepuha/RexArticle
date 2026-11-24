@@ -26,7 +26,10 @@ from indexer import (
     update_source_index,
     update_index_for_store,
 )
-from core.trigu_api import TriguApiError, TriguClient, load_api_key, save_api_key
+from core.trigu_api import (
+    TriguApiError, TriguClient, load_api_key, load_category_order,
+    load_marketplace_order, save_api_key, save_trigu_preferences,
+)
 from matcher import get_matcher_options, resolve_matcher_name
 from core.text_normalization import normalize_article
 from core.ozon_sizes import (
@@ -1079,6 +1082,44 @@ class SettingsWindow(QDialog):
         layout.addLayout(buttons)
         self.trigu_status = QLabel("Ключ сохранён" if load_api_key() else "Не подключено")
         layout.addWidget(self.trigu_status)
+
+        order_title = QLabel("Порядок площадок")
+        order_title.setObjectName("settingsTitle")
+        layout.addWidget(order_title)
+        self.trigu_marketplace_order = QComboBox()
+        self.trigu_marketplace_order.addItem("Сначала WB, затем Ozon", ["WB", "OZON"])
+        self.trigu_marketplace_order.addItem("Сначала Ozon, затем WB", ["OZON", "WB"])
+        current_order = load_marketplace_order()
+        self.trigu_marketplace_order.setCurrentIndex(
+            1 if current_order[0] == "OZON" else 0
+        )
+        self.trigu_marketplace_order.currentIndexChanged.connect(
+            self._save_trigu_order_settings
+        )
+        layout.addWidget(self.trigu_marketplace_order)
+
+        category_title = QLabel("Порядок категорий товаров")
+        category_title.setObjectName("settingsTitle")
+        layout.addWidget(category_title)
+        category_hint = QLabel(
+            "Категории появляются после загрузки поставок Trigu. "
+            "Товары неизвестных категорий добавляются в конец списка."
+        )
+        category_hint.setWordWrap(True)
+        layout.addWidget(category_hint)
+        self.trigu_category_order = QListWidget()
+        self.trigu_category_order.addItems(load_category_order())
+        self.trigu_category_order.setMaximumHeight(180)
+        layout.addWidget(self.trigu_category_order)
+        category_buttons = QHBoxLayout()
+        category_up = QPushButton("Вверх")
+        category_down = QPushButton("Вниз")
+        category_up.clicked.connect(lambda: self._move_trigu_category(-1))
+        category_down.clicked.connect(lambda: self._move_trigu_category(1))
+        category_buttons.addWidget(category_up)
+        category_buttons.addWidget(category_down)
+        category_buttons.addStretch()
+        layout.addLayout(category_buttons)
         layout.addStretch()
         return tab
     def _load_app_config(self):
@@ -1133,6 +1174,28 @@ class SettingsWindow(QDialog):
             self.trigu_status.setText(f"Ошибка подключения: {error}")
         else:
             self.trigu_status.setText("Подключение к Trigu установлено")
+
+    def _trigu_category_values(self):
+        return [
+            self.trigu_category_order.item(index).text()
+            for index in range(self.trigu_category_order.count())
+        ]
+
+    def _save_trigu_order_settings(self, *_):
+        save_trigu_preferences(
+            marketplace_order=self.trigu_marketplace_order.currentData(),
+            category_order=self._trigu_category_values(),
+        )
+
+    def _move_trigu_category(self, offset):
+        row = self.trigu_category_order.currentRow()
+        target = row + offset
+        if row < 0 or target < 0 or target >= self.trigu_category_order.count():
+            return
+        item = self.trigu_category_order.takeItem(row)
+        self.trigu_category_order.insertItem(target, item)
+        self.trigu_category_order.setCurrentRow(target)
+        self._save_trigu_order_settings()
 
     def _clear_inline_styles(self):
         """Оставляет оформление глобальной системной теме, а не жёстким цветам."""

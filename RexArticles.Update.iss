@@ -1,5 +1,7 @@
 #define MyAppName "RexArticles"
-#define MyAppVersion "1.0.2"
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.0-dev"
+#endif
 #define MyAppPublisher "RexArticles"
 #define MyAppExeName "RexArticles.exe"
 #define MyAppId "{E98B78A5-6742-4E36-97E2-34AB8070BF63}"
@@ -17,7 +19,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=release_windows
-OutputBaseFilename=RexArticles_Update_v{#MyAppVersion}
+OutputBaseFilename=RexArticles-Update-v{#MyAppVersion}
 SetupIconFile=icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/ultra64

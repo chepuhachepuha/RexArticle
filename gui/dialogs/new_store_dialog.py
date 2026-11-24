@@ -1,4 +1,5 @@
 import os
+from copy import deepcopy
 import sys
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -204,9 +205,9 @@ class NewStoreDialog(QDialog):
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
         form_layout.addWidget(self.type_combo, 1, 1)
 
-        source_label = QLabel("Источник файлов:")
-        source_label.setStyleSheet("font-weight: 500;")
-        form_layout.addWidget(source_label, 2, 0)
+        self.source_label = QLabel("Источник файлов:")
+        self.source_label.setStyleSheet("font-weight: 500;")
+        form_layout.addWidget(self.source_label, 2, 0)
 
         self.source_combo = QComboBox()
         self.source_combo.addItem("Локально или сетевая папка", "local")
@@ -260,9 +261,28 @@ class NewStoreDialog(QDialog):
 
         self.create_widgets = [
             store_label, self.store_name_input, type_label, self.type_combo,
-            source_label, self.source_combo, self.folder_label,
+            self.source_label, self.source_combo, self.folder_label,
             self.folder_input, self.browse_button,
         ]
+        self.manual_source_widgets = [
+            self.source_label, self.source_combo, self.folder_label,
+            self.folder_input, self.browse_button,
+        ]
+
+        self.template_container = QFrame()
+        template_layout = QGridLayout(self.template_container)
+        template_layout.setContentsMargins(0, 0, 0, 0)
+        template_layout.setSpacing(10)
+        template_layout.addWidget(QLabel("Профиль-шаблон:"), 0, 0)
+        self.template_store_combo = QComboBox()
+        self.template_store_combo.setStyleSheet(COMBOBOX_STYLE)
+        self.template_store_combo.setFrame(False)
+        template_layout.addWidget(self.template_store_combo, 0, 1)
+        self.template_info = QLabel()
+        self.template_info.setWordWrap(True)
+        self.template_info.setStyleSheet("color: #757575; font-size: 11px;")
+        template_layout.addWidget(self.template_info, 1, 0, 1, 2)
+        layout.addWidget(self.template_container)
 
         self.profile_container = QFrame()
         profile_layout = QGridLayout(self.profile_container)
@@ -290,6 +310,9 @@ class NewStoreDialog(QDialog):
         )
         self.profile_type_combo.currentTextChanged.connect(
             self._refresh_profile_info
+        )
+        self.template_store_combo.currentIndexChanged.connect(
+            self._refresh_template_info
         )
 
         # Информация о существующих типах
@@ -361,15 +384,19 @@ class NewStoreDialog(QDialog):
         if self.store_name in self.stores:
             self.profile_store_combo.setCurrentText(self.store_name)
         self._refresh_profile_types(self.profile_store_combo.currentText())
+        self._refresh_template_profiles()
         self._on_mode_changed()
 
     def _on_mode_changed(self, *_):
         temporary = self.profile_mode.isChecked()
         for widget in self.create_widgets:
             widget.setVisible(not temporary)
+        self.template_container.setVisible(not temporary)
         self.profile_container.setVisible(temporary)
         if self.existing_info_label:
             self.existing_info_label.setVisible(not temporary)
+        if not temporary:
+            self._update_manual_source_visibility()
         self.save_button.setText("Использовать" if temporary else "Сохранить")
         self.title_label.setText(
             "Выберите существующий профиль для текущего PDF"
@@ -379,6 +406,45 @@ class NewStoreDialog(QDialog):
                 if self.existing_store else "Обнаружен новый магазин"
             )
         )
+
+    def _refresh_template_profiles(self):
+        current = self.template_store_combo.currentData()
+        supply_type = self.type_combo.currentText()
+        available = [
+            name for name, data in self.stores.items()
+            if supply_type in data
+        ]
+        self.template_store_combo.blockSignals(True)
+        self.template_store_combo.clear()
+        self.template_store_combo.addItem("Не использовать", None)
+        for name in sorted(available, key=str.casefold):
+            self.template_store_combo.addItem(name, name)
+        index = self.template_store_combo.findData(current)
+        self.template_store_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.template_store_combo.blockSignals(False)
+        self._refresh_template_info()
+
+    def _refresh_template_info(self, *_):
+        template_store = self.template_store_combo.currentData()
+        supply_type = self.type_combo.currentText()
+        type_data = self.stores.get(template_store, {}).get(supply_type, {})
+        if not type_data:
+            self.template_info.setText(
+                "Без шаблона: укажите источник и папку вручную."
+            )
+        else:
+            self.template_info.setText(
+                "Будет создана точная копия настроек профиля "
+                f"«{template_store}» для {supply_type}.\n"
+                f"Папка: {type_data.get('path', '')}"
+            )
+        self._update_manual_source_visibility()
+
+    def _update_manual_source_visibility(self):
+        use_template = bool(self.template_store_combo.currentData())
+        show_manual_source = self.create_mode.isChecked() and not use_template
+        for widget in self.manual_source_widgets:
+            widget.setVisible(show_manual_source)
 
     def _refresh_profile_types(self, store_name):
         current = self.profile_type_combo.currentText()
@@ -410,6 +476,7 @@ class NewStoreDialog(QDialog):
     def on_type_changed(self, new_type):
         new_store = self.extract_store_by_type(new_type)
         self.store_name_input.setText(new_store)
+        self._refresh_template_profiles()
 
     def on_source_changed(self):
         self.folder_label.setText("Папка с принтами:")
@@ -460,6 +527,7 @@ class NewStoreDialog(QDialog):
 
         store_name = self.store_name_input.text().strip()
         supply_type = self.type_combo.currentText()
+        template_store = self.template_store_combo.currentData()
         source = self.source_combo.currentData()
         folder = self.folder_input.text().strip()
 
@@ -470,7 +538,8 @@ class NewStoreDialog(QDialog):
             )
             return
 
-        if not folder or (source == "local" and not os.path.isdir(folder)):
+        if (not template_store
+                and (not folder or (source == "local" and not os.path.isdir(folder)))):
             QMessageBox.warning(
                 self, "Ошибка",
                 "Выберите корректную папку с принтами"
@@ -490,16 +559,28 @@ class NewStoreDialog(QDialog):
 
         if store_name not in stores:
             stores[store_name] = {}
-        stores[store_name][supply_type] = {
-            "path": folder,
-            "matcher": "Simple",
-            "copy_on_override": False,
-            "override_path": "",
-            "source": source,
-            "png_only": False,
-            "size_ranges": [],
-            "additional_sources": [],
-        }
+        if template_store:
+            template_data = stores.get(template_store, {}).get(supply_type)
+            if not template_data:
+                QMessageBox.warning(
+                    self, "Ошибка",
+                    "У выбранного профиля нет настроек для этого типа поставки"
+                )
+                return
+            stores[store_name][supply_type] = deepcopy(template_data)
+            folder = template_data.get("path", "")
+            source = template_data.get("source", "local")
+        else:
+            stores[store_name][supply_type] = {
+                "path": folder,
+                "matcher": "Simple",
+                "copy_on_override": False,
+                "override_path": "",
+                "source": source,
+                "png_only": False,
+                "size_ranges": [],
+                "additional_sources": [],
+            }
 
         save_stores(stores)
 

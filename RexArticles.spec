@@ -3,6 +3,7 @@ import os
 import ssl
 
 block_cipher = None
+app_version = os.environ.get("REXARTICLES_VERSION", "0.0.0-dev")
 certificate_datas = []
 certificate_candidates = [
     ssl.get_default_verify_paths().cafile,
@@ -95,6 +96,8 @@ app = BUNDLE(
     bundle_identifier='ru.rexarticles.app',
     info_plist={
         'CFBundleDisplayName': 'RexArticles',
+        'CFBundleShortVersionString': app_version,
+        'CFBundleVersion': app_version,
         'NSHighResolutionCapable': True,
     },
 )

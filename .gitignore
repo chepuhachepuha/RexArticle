@@ -26,6 +26,7 @@ logs/
 build/
 dist/
 release/
+release_windows/
 *.rar
 *.zip
 *.exe

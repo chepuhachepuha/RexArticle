@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-latest
+            platform: windows
+          - name: macOS Apple Silicon
+            runner: macos-14
+            platform: macos
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONDONTWRITEBYTECODE: '1'
+      REXARTICLES_VERSION: 0.0.0-ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pyinstaller==6.16.0
+      - name: Run tests
+        run: python -m unittest discover -s tests
+      - name: Assert Apple Silicon runner
+        if: matrix.platform == 'macos'
+        run: test "$(uname -m)" = arm64
+      - name: Build macOS application
+        if: matrix.platform == 'macos'
+        run: python -m PyInstaller --noconfirm --clean RexArticles.spec
+      - name: Verify macOS bundle
+        if: matrix.platform == 'macos'
+        run: |
+          test -x dist/RexArticles.app/Contents/MacOS/RexArticles
+          plutil -p dist/RexArticles.app/Contents/Info.plist
+      - name: Install Inno Setup
+        if: matrix.platform == 'windows'
+        run: choco install innosetup --no-progress -y
+      - name: Build Windows application and installer
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean RexArticles.Windows.spec
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.0.0-ci RexArticles.iss
+          if (!(Test-Path "release_windows\RexArticles-Setup-v0.0.0-ci.exe")) { throw "Windows installer was not created" }

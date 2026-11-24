@@ -240,6 +240,60 @@ class TemporaryProfileDialogTests(unittest.TestCase):
                 first.close()
                 second.close()
 
+    def test_detected_new_store_can_copy_current_type_from_template(self):
+        stores = {
+            "Profile": {
+                "WB": {
+                    "path": "/prints/wb",
+                    "source": "local",
+                    "matcher": "Kristabell",
+                    "size_ranges": [{"pattern": "S", "sizes": ["S"]}],
+                    "additional_sources": [
+                        {"source": "local", "path": "/shared/prints"},
+                    ],
+                },
+                "OZON": {"path": "disk:/prints/ozon", "source": "yandex"},
+            }
+        }
+        with patch.object(
+            new_store_dialog, "get_pdf_text", return_value="",
+        ), patch.object(
+            new_store_dialog, "detect_supply_type",
+            return_value={"store_name": "Detected shop", "supply_type": "WB"},
+        ), patch.object(
+            new_store_dialog, "load_stores", return_value=stores,
+        ), patch.object(new_store_dialog, "save_stores") as save_mock:
+            dialog = new_store_dialog.NewStoreDialog(None, "detected.pdf")
+            try:
+                self.assertTrue(dialog.create_mode.isChecked())
+                self.assertFalse(dialog.template_container.isHidden())
+                self.assertEqual(
+                    [dialog.template_store_combo.itemText(index)
+                     for index in range(dialog.template_store_combo.count())],
+                    ["Не использовать", "Profile"],
+                )
+                dialog.template_store_combo.setCurrentText("Profile")
+                self.assertTrue(dialog.folder_input.isHidden())
+                dialog.save()
+
+                saved_stores = save_mock.call_args.args[0]
+                copied = saved_stores["Detected shop"]["WB"]
+                self.assertEqual(copied, stores["Profile"]["WB"])
+                self.assertIsNot(copied, stores["Profile"]["WB"])
+                self.assertIsNot(
+                    copied["additional_sources"],
+                    stores["Profile"]["WB"]["additional_sources"],
+                )
+                self.assertNotIn("OZON", saved_stores["Detected shop"])
+                self.assertEqual(dialog.result, {
+                    "store_name": "Detected shop",
+                    "supply_type": "WB",
+                    "folder": "/prints/wb",
+                    "source": "local",
+                })
+            finally:
+                dialog.close()
+
 
 if __name__ == "__main__":
     unittest.main()

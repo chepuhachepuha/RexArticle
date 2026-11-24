@@ -64,7 +64,7 @@ def is_network_path(path: str) -> bool:
 
     if sys.platform == "darwin" and normalised.startswith("/Volumes/"):
         for mount_path in _read_macos_network_mounts():
-            if normalised == mount_path or normalised.startswith(mount_path + os.sep):
+            if normalised == mount_path or normalised.startswith(mount_path + "/"):
                 return True
         volume_name = normalised[len("/Volumes/"):].split("/", 1)[0].casefold()
         return any(marker in volume_name for marker in ("webdav", "yandex", "dav"))

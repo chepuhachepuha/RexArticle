@@ -53,9 +53,11 @@ class SharedSourceIndexTests(unittest.TestCase):
         database = Path(self.database_dir) / indexer.DB_FILENAME
         database.parent.mkdir(parents=True)
         file_path = str(self.source / "ART.png")
-        with sqlite3.connect(database) as connection:
-            connection.executescript(
-                """
+        connection = sqlite3.connect(database)
+        try:
+            with connection:
+                connection.executescript(
+                    """
                 CREATE TABLE store_state(
                     store TEXT PRIMARY KEY, schema_version INTEGER NOT NULL,
                     last_scan_ns INTEGER NOT NULL DEFAULT 0
@@ -70,19 +72,21 @@ class SharedSourceIndexTests(unittest.TestCase):
                     priority INTEGER NOT NULL, PRIMARY KEY(store, path)
                 );
                 """
-            )
-            for store in ("First_WB", "Second_OZON"):
-                connection.execute(
-                    "INSERT INTO store_state VALUES (?, 3, 0)", (store,)
                 )
-                connection.execute(
-                    "INSERT INTO roots VALUES (?, 1, ?)",
-                    (store, str(self.source)),
-                )
-                connection.execute(
-                    "INSERT INTO files VALUES (?, ?, 'art', 0, 0, 1)",
-                    (store, file_path),
-                )
+                for store in ("First_WB", "Second_OZON"):
+                    connection.execute(
+                        "INSERT INTO store_state VALUES (?, 3, 0)", (store,)
+                    )
+                    connection.execute(
+                        "INSERT INTO roots VALUES (?, 1, ?)",
+                        (store, str(self.source)),
+                    )
+                    connection.execute(
+                        "INSERT INTO files VALUES (?, ?, 'art', 0, 0, 1)",
+                        (store, file_path),
+                    )
+        finally:
+            connection.close()
         with indexer._open_connection() as connection:
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM source_state").fetchone()[0],

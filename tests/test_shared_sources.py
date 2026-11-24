@@ -40,7 +40,7 @@ class SharedSourceIndexTests(unittest.TestCase):
         indexer.update_index_for_store(
             "Second_OZON", str(self.source), updated_source_keys=shared
         )
-        with indexer._connect() as connection:
+        with indexer._open_connection() as connection:
             sources = connection.execute("SELECT COUNT(*) FROM source_state").fetchone()[0]
             files = connection.execute("SELECT COUNT(*) FROM source_files").fetchone()[0]
         self.assertEqual((sources, files), (1, 1))
@@ -83,7 +83,7 @@ class SharedSourceIndexTests(unittest.TestCase):
                     "INSERT INTO files VALUES (?, ?, 'art', 0, 0, 1)",
                     (store, file_path),
                 )
-        with indexer._connect() as connection:
+        with indexer._open_connection() as connection:
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM source_state").fetchone()[0],
                 1,

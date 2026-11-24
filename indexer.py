@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import sqlite3
+from contextlib import contextmanager
 from core.text_normalization import normalize_article
 import sys  # Compatibility for existing platform-detection tests/callers.
 import time
@@ -159,6 +160,17 @@ def _connect() -> sqlite3.Connection:
             f"{len(legacy_stores)} индексов"
         )
     return connection
+
+
+@contextmanager
+def _open_connection():
+    """Commit/roll back an index operation and always close its SQLite file."""
+    connection = _connect()
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def _normalise_path(path: str) -> str:
@@ -563,7 +575,7 @@ def get_index_for_source(source_type: str, path: str) -> dict:
     spec = normalise_source(source_type, path)
     if spec["key"] in SOURCE_INDEX_CACHE:
         return SOURCE_INDEX_CACHE[spec["key"]]
-    with _connect() as connection:
+    with _open_connection() as connection:
         rows = connection.execute(
             """
             SELECT article, path FROM source_files
@@ -580,7 +592,7 @@ def get_index_for_source(source_type: str, path: str) -> dict:
 
 def has_source_index(source_type: str, path: str) -> bool:
     spec = normalise_source(source_type, path)
-    with _connect() as connection:
+    with _open_connection() as connection:
         return connection.execute(
             "SELECT 1 FROM source_state WHERE source_key = ?",
             (spec["key"],),
@@ -593,7 +605,7 @@ def prune_unreferenced_sources(referenced_sources) -> int:
         for item in referenced_sources
         if isinstance(item, dict) and str(item.get("path", "")).strip()
     }
-    with _connect() as connection:
+    with _open_connection() as connection:
         existing = {
             row[0] for row in connection.execute("SELECT source_key FROM source_state")
         }
@@ -627,7 +639,7 @@ def update_source_index(
         )
 
     started = time.perf_counter()
-    with _connect() as connection:
+    with _open_connection() as connection:
         state, previous_files, previous_directories = _load_source_state(
             connection, spec["key"]
         )
@@ -672,7 +684,7 @@ def update_source_index(
         file_path for file_path in set(previous_files) & set(new_files)
         if previous_files[file_path] != new_files[file_path]
     }
-    with _connect() as connection:
+    with _open_connection() as connection:
         with connection:
             connection.execute(
                 """
@@ -819,7 +831,7 @@ def get_index_for_store(store_name: str) -> dict:
     if store_name in INDEX_CACHE:
         return INDEX_CACHE[store_name]
 
-    with _connect() as connection:
+    with _open_connection() as connection:
         roots = connection.execute(
             "SELECT path FROM roots WHERE store = ? ORDER BY priority",
             (store_name,),
@@ -834,7 +846,7 @@ def get_index_for_store(store_name: str) -> dict:
                 if file_path not in bucket:
                     bucket.append(file_path)
     if not roots:
-        with _connect() as connection:
+        with _open_connection() as connection:
             legacy_rows = connection.execute(
                 """
                 SELECT article, path FROM files WHERE store = ?
@@ -858,7 +870,7 @@ def remove_missing_path_from_index(store_name: str, file_path: str) -> bool:
     if not file_path or is_yandex_uri(file_path) or os.path.exists(file_path):
         return False
 
-    with _connect() as connection:
+    with _open_connection() as connection:
         with connection:
             legacy_cursor = connection.execute(
                 "DELETE FROM files WHERE store = ? AND path = ?",
@@ -902,7 +914,7 @@ def update_index_for_store(
         ) or changed
         if updated_source_keys is not None:
             updated_source_keys.add(spec["key"])
-    with _connect() as connection:
+    with _open_connection() as connection:
         with connection:
             connection.execute("DELETE FROM roots WHERE store = ?", (store_name,))
             connection.execute("DELETE FROM store_state WHERE store = ?", (store_name,))
@@ -934,7 +946,7 @@ def _update_yandex_source_index(
     progress_callback=None, cancel_token=None,
 ):
     started = time.perf_counter()
-    with _connect() as connection:
+    with _open_connection() as connection:
         state, previous_files, _directories = _load_source_state(
             connection, spec["key"]
         )
@@ -970,7 +982,7 @@ def _update_yandex_source_index(
             "directory": os.path.dirname(resource.uri),
         }
 
-    with _connect() as connection:
+    with _open_connection() as connection:
         with connection:
             connection.execute(
                 """
@@ -1020,7 +1032,7 @@ def update_yandex_index_for_store(
         spec, force=force, client=client, token=token,
         progress_callback=progress_callback, cancel_token=cancel_token,
     )
-    with _connect() as connection:
+    with _open_connection() as connection:
         with connection:
             connection.execute("DELETE FROM roots WHERE store = ?", (store_name,))
             connection.execute("DELETE FROM store_state WHERE store = ?", (store_name,))
@@ -1040,7 +1052,7 @@ def update_yandex_index_for_store(
     root_uri = to_yandex_uri(cloud_path)
     roots = [{"path": root_uri, "priority": 1}]
 
-    with _connect() as connection:
+    with _open_connection() as connection:
         previous_state, previous_roots, previous_files = _load_store_state(
             connection, store_name
         )
@@ -1104,7 +1116,7 @@ def update_yandex_index_for_store(
             "priority": 1,
         }
 
-    with _connect() as connection:
+    with _open_connection() as connection:
         if full_rebuild:
             added_paths = set(current_files)
             changed_paths = set()
@@ -1289,7 +1301,7 @@ def remove_index_for_store(store_name: str):
     """Удаляет из SQLite только индекс выбранного магазина/типа."""
     print(f"[INDEX] Явное удаление индекса магазина: {store_name}")
     INDEX_CACHE.pop(store_name, None)
-    with _connect() as connection:
+    with _open_connection() as connection:
         with connection:
             connection.execute("DELETE FROM store_state WHERE store = ?", (store_name,))
     _remove_legacy_files(store_name)

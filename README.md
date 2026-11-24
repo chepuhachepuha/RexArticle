@@ -1,6 +1,6 @@
 # RexArticles
 
-Кроссплатформенное приложение для поиска и сбора файлов принтов по артикулам поставок WB и Ozon. Работает на macOS Apple Silicon и Windows 10/11 x64.
+Кроссплатформенное приложение для поиска и сбора файлов принтов по артикулам поставок WB и Ozon. Работает на Windows 10/11 x64 и macOS; на Apple Silicon используется Rosetta.
 
 ## Возможности
 
@@ -34,6 +34,6 @@ git tag -a v1.0.3 -m "RexArticles 1.0.3"
 git push origin main --follow-tags
 ```
 
-GitHub Actions проверит тесты, соберёт установщик Windows x64 и приложение macOS Apple Silicon, а затем опубликует их в [GitHub Releases](https://github.com/chepuhachepuha/RexArticle/releases). Релиз содержит `RexArticles-Setup-vX.Y.Z.exe` и `RexArticles-macos-arm64-vX.Y.Z.zip`.
+GitHub Actions проверит тесты, соберёт установщик Windows x64 и приложение macOS x64, а затем опубликует их в [GitHub Releases](https://github.com/chepuhachepuha/RexArticle/releases). Релиз содержит `RexArticles-Setup-vX.Y.Z.exe` и `RexArticles-macos-x64-vX.Y.Z.zip`.
 
 Пакеты первого этапа не подписаны сертификатами Apple или Windows, поэтому система может запросить дополнительное подтверждение при первом запуске.

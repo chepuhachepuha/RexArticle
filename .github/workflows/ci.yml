@@ -20,12 +20,13 @@ jobs:
           - name: Windows x64
             runner: windows-latest
             platform: windows
-          - name: macOS Apple Silicon
-            runner: macos-14
+          - name: macOS x64
+            runner: macos-13
             platform: macos
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
       REXARTICLES_VERSION: 0.0.0-ci
     steps:
       - uses: actions/checkout@v4
@@ -36,9 +37,9 @@ jobs:
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pyinstaller==6.16.0
       - name: Run tests
         run: python -m unittest discover -s tests
-      - name: Assert Apple Silicon runner
+      - name: Assert macOS x64 runner
         if: matrix.platform == 'macos'
-        run: test "$(uname -m)" = arm64
+        run: test "$(uname -m)" = x86_64
       - name: Build macOS application
         if: matrix.platform == 'macos'
         run: python -m PyInstaller --noconfirm --clean RexArticles.spec

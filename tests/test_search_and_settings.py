@@ -515,7 +515,7 @@ class MatcherExtensionFilterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = str(Path(directory) / "indexes.sqlite3")
             with patch.object(indexer_module, "_get_db_path", return_value=database):
-                with indexer_module._connect() as connection:
+                with indexer_module._open_connection() as connection:
                     connection.execute(
                         """
                         INSERT INTO store_state(store, schema_version, last_scan_ns)
@@ -867,7 +867,7 @@ class StaleIndexPathTests(unittest.TestCase):
         ):
             store = "Shop_WB"
             stale = str(Path(directory) / "missing.png")
-            with indexer_module._connect() as connection:
+            with indexer_module._open_connection() as connection:
                 with connection:
                     connection.execute(
                         "INSERT INTO store_state(store, schema_version, last_scan_ns) "

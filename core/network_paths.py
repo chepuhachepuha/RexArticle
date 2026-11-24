@@ -1,6 +1,7 @@
 """Detection and serialization helpers for mounted network filesystems."""
 from contextlib import nullcontext
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -52,7 +53,12 @@ def is_network_path(path: str) -> bool:
     """Return True for mounted WebDAV/remote paths without reading contents."""
     if not path:
         return False
-    normalised = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+    if sys.platform == "darwin":
+        # Keep macOS mount paths meaningful even when this function is tested
+        # from a non-POSIX host.
+        normalised = posixpath.normpath(os.path.expanduser(path))
+    else:
+        normalised = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
     if normalised.startswith(("//", "\\\\")):
         return True
 

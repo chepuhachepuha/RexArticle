@@ -109,7 +109,7 @@ RexArticles — настольное приложение для автомат�
 
 Пользовательские данные не должны храниться внутри `.app` и сохраняются при обновлении программы.
 
-- macOS: `~/Library/Application Support/RexArticles`
+- macOS: `~/Library/Application Support/RexArticles` (в том числе при запуске на Apple Silicon через Rosetta)
 - Windows: рядом с `RexArticles.exe`; установщик сохраняет эти файлы при обновлении.
 
 Основные пользовательские файлы:

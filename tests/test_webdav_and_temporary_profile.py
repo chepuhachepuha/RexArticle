@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -147,6 +148,12 @@ class WebDavIndexTests(unittest.TestCase):
             changed = indexer.update_source_index("local", str(self.source))
         self.assertFalse(changed)
         scanner.assert_not_called()
+
+    def test_context_managed_index_connection_releases_database_file(self):
+        with indexer._open_connection() as connection:
+            connection.execute("SELECT 1")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
 
     def test_transient_directory_error_is_retried(self):
         original_scandir = os.scandir

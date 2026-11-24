@@ -15,11 +15,12 @@ permissions:
 
 jobs:
   macos:
-    name: Build macOS Apple Silicon release
-    runs-on: macos-14
+    name: Build macOS x64 release
+    runs-on: macos-13
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,11 +37,11 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          test "$(uname -m)" = arm64
+          test "$(uname -m)" = x86_64
           VERSION="${RELEASE_TAG#v}"
           REXARTICLES_VERSION="$VERSION" python -m PyInstaller --noconfirm --clean RexArticles.spec
           mkdir release
-          ditto -c -k --sequesterRsrc --keepParent dist/RexArticles.app "release/RexArticles-macos-arm64-v${VERSION}.zip"
+          ditto -c -k --sequesterRsrc --keepParent dist/RexArticles.app "release/RexArticles-macos-x64-v${VERSION}.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-release
@@ -53,6 +54,7 @@ jobs:
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
         with:

@@ -13,7 +13,7 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\Programs\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-DisableDirPage=no
+DisableDirPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -26,6 +26,7 @@ SolidCompression=yes
 WizardStyle=modern
 CloseApplications=yes
 RestartApplications=no
+UsePreviousAppDir=yes
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
@@ -34,7 +35,10 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"; GroupDescription: "Дополнительные значки:"; Flags: unchecked
 
 [Files]
-Source: "dist\RexArticles\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "config.json,stores.json,manual_overrides.json"
+; The AppId and UsePreviousAppDir make a newer installer update the existing
+; RexArticles installation. User data is deliberately never installed or
+; overwritten, so it also remains after an update or uninstall.
+Source: "dist\RexArticles\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "config.json,stores.json,manual_overrides.json,article_corrections.json,index\*,logs\*"
 
 [Icons]
 Name: "{group}\RexArticles"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"

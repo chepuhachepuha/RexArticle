@@ -34,6 +34,8 @@ git tag -a v1.0.3 -m "RexArticles 1.0.3"
 git push origin main --follow-tags
 ```
 
-GitHub Actions проверит тесты, соберёт установщик Windows x64 и приложение macOS x64, а затем опубликует их в [GitHub Releases](https://github.com/chepuhachepuha/RexArticle/releases). Релиз содержит `RexArticles-Setup-vX.Y.Z.exe` и `RexArticles-macos-x64-vX.Y.Z.zip`.
+GitHub Actions проверит тесты и сразу опубликует Windows x64 установщик в [GitHub Releases](https://github.com/chepuhachepuha/RexArticle/releases). macOS-архив добавится в тот же релиз после окончания macOS-сборки.
+
+Повторный запуск `RexArticles-Setup-vX.Y.Z.exe` обновляет существующую установку с тем же идентификатором приложения. Файлы `config.json`, `stores.json`, ручные корректировки, индексы и логи не перезаписываются.
 
 Пакеты первого этапа не подписаны сертификатами Apple или Windows, поэтому система может запросить дополнительное подтверждение при первом запуске.

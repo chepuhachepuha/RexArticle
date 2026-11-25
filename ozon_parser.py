@@ -129,10 +129,10 @@ def is_empty_row(row) -> bool:
     return all(not cell or str(cell).strip() == "" for cell in row)
 
 
-_TRIGU_PICK_LIST_HEADERS = (
-    "№", "ФОТО", "НАЗВАНИЕ", "ЦВЕТ", "РАЗМЕР", "АРТИКУЛ",
-    "СТИКЕР-ЗАКАЗ",
+_TRIGU_PICK_LIST_REQUIRED_HEADERS = (
+    "№", "ФОТО", "НАЗВАНИЕ", "ЦВЕТ", "АРТИКУЛ", "СТИКЕР-ЗАКАЗ",
 )
+_TRIGU_PICK_LIST_OPTIONAL_HEADERS = ("РАЗМЕР",)
 
 
 def _join_pick_list_cell_lines(value: str) -> str:
@@ -152,11 +152,14 @@ def _join_pick_list_cell_lines(value: str) -> str:
 
 def _trigu_pick_list_header_words(page):
     headers = {}
+    supported_headers = set(
+        _TRIGU_PICK_LIST_REQUIRED_HEADERS + _TRIGU_PICK_LIST_OPTIONAL_HEADERS
+    )
     for word in page.get_text("words"):
         text = str(word[4]).strip().upper()
-        if text in _TRIGU_PICK_LIST_HEADERS and text not in headers:
+        if text in supported_headers and text not in headers:
             headers[text] = word
-    if not set(_TRIGU_PICK_LIST_HEADERS).issubset(headers):
+    if not set(_TRIGU_PICK_LIST_REQUIRED_HEADERS).issubset(headers):
         return None
     return headers
 
@@ -211,7 +214,6 @@ def _trigu_pick_list_page_layout(page):
     photo_header = headers["ФОТО"]
     name_header = headers["НАЗВАНИЕ"]
     color_header = headers["ЦВЕТ"]
-    size_header = headers["РАЗМЕР"]
     article_header = headers["АРТИКУЛ"]
     sticker_header = headers["СТИКЕР-ЗАКАЗ"]
     verticals = [
@@ -219,14 +221,33 @@ def _trigu_pick_list_page_layout(page):
         (number_header[2] + photo_header[0]) / 2,
         (photo_header[2] + name_header[0]) / 2,
         color_header[0] - 8,
-        size_header[0] - 5,
-        (size_header[2] + article_header[0]) / 2,
-        sticker_header[0] - 6,
-        table_right,
     ]
+    size_header = headers.get("РАЗМЕР")
+    if size_header:
+        verticals.extend([
+            size_header[0] - 5,
+            (size_header[2] + article_header[0]) / 2,
+            sticker_header[0] - 6,
+            table_right,
+        ])
+        size_cell = (verticals[4], verticals[5])
+        article_cell = (verticals[5], verticals[6])
+    else:
+        verticals.extend([
+            (color_header[2] + article_header[0]) / 2,
+            sticker_header[0] - 6,
+            table_right,
+        ])
+        size_cell = None
+        article_cell = (verticals[4], verticals[5])
     if verticals != sorted(verticals):
         return None
-    return verticals, boundaries
+    cells = {
+        "name": (verticals[2], verticals[3]),
+        "size": size_cell,
+        "article": article_cell,
+    }
+    return verticals, boundaries, cells
 
 
 def _draw_trigu_pick_list_grid(page, verticals, boundaries):
@@ -253,7 +274,7 @@ def _parse_trigu_ozon_pick_list(pdf_path: str):
             layout = _trigu_pick_list_page_layout(page)
             if layout is None:
                 continue
-            verticals, boundaries = layout
+            verticals, boundaries, cells = layout
             _draw_trigu_pick_list_grid(page, verticals, boundaries)
             for top, bottom in zip(boundaries[1:], boundaries[2:]):
                 number = page.get_textbox(
@@ -263,20 +284,28 @@ def _parse_trigu_ozon_pick_list(pdf_path: str):
                     continue
 
                 product_name = page.get_textbox(
-                    fitz.Rect(verticals[2], top, verticals[3], bottom)
+                    fitz.Rect(cells["name"][0], top, cells["name"][1], bottom)
                 ).strip()
-                size_text = page.get_textbox(
-                    fitz.Rect(verticals[4], top, verticals[5], bottom)
+                size_cell = cells["size"]
+                size_text = (
+                    page.get_textbox(fitz.Rect(size_cell[0], top, size_cell[1], bottom))
+                    if size_cell else ""
                 )
+                article_cell = cells["article"]
                 article_text = page.get_textbox(
-                    fitz.Rect(verticals[5], top, verticals[6], bottom)
+                    fitz.Rect(article_cell[0], top, article_cell[1], bottom)
                 )
                 article = _join_pick_list_cell_lines(article_text)
                 if not article:
                     continue
                 size_lines = [line.strip() for line in size_text.splitlines() if line.strip()]
+                size = normalize_size(size_lines[0]) if size_lines else "0"
+                if size != "0":
+                    article_without_size = _strip_task_size_suffix(article, size)
+                    if article_without_size is not None:
+                        article = article_without_size
                 articles.append(article)
-                sizes.append(normalize_size(size_lines[0]) if size_lines else "0")
+                sizes.append(size)
                 locations.append(extract_print_location(product_name))
     return articles, sizes, locations
 

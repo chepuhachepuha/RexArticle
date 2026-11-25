@@ -67,7 +67,7 @@ class OzonParserTests(unittest.TestCase):
 
     def test_detects_trigu_ozon_pick_list_metadata(self):
         lines = [
-            "OZON", "Никита Озон вечер 25.11 - 4", "OZ-WH-002 9456",
+            "OZON", "Никита Озон вечер", "25.11 - 4", "OZ-WH-002 9456",
             "МАГАЗИН", "Никита Озон", "№", "ФОТО", "НАЗВАНИЕ",
             "ЦВЕТ", "РАЗМЕР", "АРТИКУЛ", "СТИКЕР-ЗАКАЗ",
         ]
@@ -82,6 +82,17 @@ class OzonParserTests(unittest.TestCase):
                     "supply_type": "OZON",
                 },
             )
+
+    def test_detects_trigu_pick_list_without_size_column(self):
+        lines = [
+            "OZON", "АниРекс Озон вечер Шопперы 25.11", "OZ-WH-002 9423",
+            "МАГАЗИН", "АниРекс Озон", "№", "ФОТО", "НАЗВАНИЕ",
+            "ЦВЕТ", "АРТИКУЛ", "СТИКЕР-ЗАКАЗ",
+        ]
+        with patch("supply_detector.get_first_page_lines", return_value=lines):
+            detected = detect_supply_type("pick-list.pdf")
+        self.assertEqual(detected["store_name"], "АниРекс Озон")
+        self.assertEqual(detected["format"], "trigu_ozon_pick_list")
 
     def test_trigu_pick_list_wrapped_articles_are_joined(self):
         self.assertEqual(
@@ -104,7 +115,7 @@ class OzonParserTests(unittest.TestCase):
                     0: "1",
                     20: "Футболка с принтом на спине",
                     40: "XL\n52",
-                    50: "f_code_\n001",
+                    50: "f_code_001, XL",
                 }.get(round(rectangle.x0), "")
 
         document = Mock()
@@ -113,11 +124,41 @@ class OzonParserTests(unittest.TestCase):
         document.__iter__ = Mock(return_value=iter([FakePage()]))
         with patch("ozon_parser.fitz.open", return_value=document), patch(
             "ozon_parser._trigu_pick_list_page_layout",
-            return_value=([0, 10, 20, 30, 40, 50, 60, 70], [0, 10, 20]),
+            return_value=(
+                [0, 10, 20, 30, 40, 50, 60, 70],
+                [0, 10, 20],
+                {"name": (20, 30), "size": (40, 50), "article": (50, 60)},
+            ),
         ), patch("ozon_parser._draw_trigu_pick_list_grid"):
             self.assertEqual(
                 _parse_trigu_ozon_pick_list("pick-list.pdf"),
                 (["f_code_001"], ["XL"], ["СПИНА"]),
+            )
+
+    def test_trigu_pick_list_without_size_uses_zero(self):
+        class FakePage:
+            def get_textbox(self, rectangle):
+                return {
+                    0: "1",
+                    20: "Кружка",
+                    40: "Кружка НГ 17",
+                }.get(round(rectangle.x0), "")
+
+        document = Mock()
+        document.__enter__ = Mock(return_value=document)
+        document.__exit__ = Mock(return_value=False)
+        document.__iter__ = Mock(return_value=iter([FakePage()]))
+        with patch("ozon_parser.fitz.open", return_value=document), patch(
+            "ozon_parser._trigu_pick_list_page_layout",
+            return_value=(
+                [0, 10, 20, 30, 40, 50, 60],
+                [0, 10, 20],
+                {"name": (20, 30), "size": None, "article": (40, 50)},
+            ),
+        ), patch("ozon_parser._draw_trigu_pick_list_grid"):
+            self.assertEqual(
+                _parse_trigu_ozon_pick_list("pick-list.pdf"),
+                (["Кружка НГ 17"], ["0"], [""]),
             )
 
     def test_trigu_pick_list_pdf_rename_uses_safe_collision_suffixes(self):

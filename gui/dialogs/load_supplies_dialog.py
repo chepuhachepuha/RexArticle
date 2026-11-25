@@ -1,11 +1,12 @@
 """Choose deliveries from Trigu or load PDF files locally."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
     QPushButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
     QWidget, QComboBox, QHeaderView, QListWidget, QListWidgetItem, QSplitter,
+    QLineEdit,
 )
 
 from core.trigu_api import (
@@ -13,8 +14,12 @@ from core.trigu_api import (
 )
 
 
+FILTER_COMBO_WIDTH = 150
+SUPPLY_SEARCH_WIDTH = 220
+
+
 class LoadSuppliesDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, auto_load=True):
         super().__init__(parent)
         self.setWindowTitle("Загрузить поставки")
         self.resize(1200, 680)
@@ -37,12 +42,28 @@ class LoadSuppliesDialog(QDialog):
         filters = QHBoxLayout()
         filters.addWidget(QLabel("Магазин:"))
         self.shop_filter = QComboBox()
+        self.shop_filter.setFixedWidth(FILTER_COMBO_WIDTH)
         self.shop_filter.currentTextChanged.connect(self._apply_filters)
         filters.addWidget(self.shop_filter)
         filters.addWidget(QLabel("Статус:"))
         self.status_filter = QComboBox()
+        self.status_filter.setFixedWidth(FILTER_COMBO_WIDTH)
         self.status_filter.currentTextChanged.connect(self._apply_filters)
         filters.addWidget(self.status_filter)
+        filters.addWidget(QLabel("Площадка:"))
+        self.marketplace_filter = QComboBox()
+        self.marketplace_filter.setFixedWidth(FILTER_COMBO_WIDTH)
+        self.marketplace_filter.addItem("Все", "")
+        self.marketplace_filter.addItem("WB", "WB")
+        self.marketplace_filter.addItem("Ozon", "OZON")
+        self.marketplace_filter.currentIndexChanged.connect(self._apply_filters)
+        filters.addWidget(self.marketplace_filter)
+        self.name_search = QLineEdit()
+        self.name_search.setPlaceholderText("Поиск по названию поставки")
+        self.name_search.setClearButtonEnabled(True)
+        self.name_search.setFixedWidth(SUPPLY_SEARCH_WIDTH)
+        self.name_search.textChanged.connect(self._apply_filters)
+        filters.addWidget(self.name_search)
         filters.addStretch()
         refresh = QPushButton("Обновить")
         refresh.clicked.connect(self._load_trigu)
@@ -120,6 +141,9 @@ class LoadSuppliesDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        if auto_load:
+            QTimer.singleShot(0, self._load_trigu)
+
     def _load_trigu(self):
         try:
             self._supplies = TriguClient().list_active_supplies()
@@ -141,6 +165,7 @@ class LoadSuppliesDialog(QDialog):
     def _populate_filters(self):
         self.shop_filter.blockSignals(True)
         self.status_filter.blockSignals(True)
+        self.marketplace_filter.blockSignals(True)
         self.shop_filter.clear(); self.shop_filter.addItem("Все")
         self.status_filter.clear()
         self.status_filter.addItem("Все", "")
@@ -149,6 +174,7 @@ class LoadSuppliesDialog(QDialog):
         self.shop_filter.addItems(sorted({item.shop for item in self._supplies}, key=str.casefold))
         self.shop_filter.blockSignals(False)
         self.status_filter.blockSignals(False)
+        self.marketplace_filter.blockSignals(False)
 
     @staticmethod
     def _status_text(status):
@@ -184,10 +210,14 @@ class LoadSuppliesDialog(QDialog):
     def _apply_filters(self):
         shop = self.shop_filter.currentText()
         status = self.status_filter.currentData() or ""
+        marketplace = self.marketplace_filter.currentData() or ""
+        name_query = self.name_search.text().casefold().strip()
         items = self._sort_supplies([
             item for item in self._supplies
             if (shop == "Все" or item.shop == shop)
             and (not status or item.status == status)
+            and (not marketplace or item.marketplace.upper() == marketplace)
+            and (not name_query or name_query in item.name.casefold())
         ])
         self._updating_table = True
         self.table.setRowCount(len(items))

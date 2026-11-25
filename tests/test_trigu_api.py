@@ -6,7 +6,9 @@ from unittest.mock import patch
 
 from core import trigu_api
 from core.trigu_api import TriguSupply
-from gui.dialogs.load_supplies_dialog import LoadSuppliesDialog
+from gui.dialogs.load_supplies_dialog import (
+    FILTER_COMBO_WIDTH, SUPPLY_SEARCH_WIDTH, LoadSuppliesDialog,
+)
 from gui.main_window import MainWindow
 from gui.widgets.supply_tree import SupplyTreeModel
 from PySide6.QtCore import Qt
@@ -106,7 +108,7 @@ class LoadSuppliesDialogTests(unittest.TestCase):
         ]
 
     def _dialog(self):
-        dialog = LoadSuppliesDialog()
+        dialog = LoadSuppliesDialog(auto_load=False)
         dialog._supplies = self._supplies()
         dialog._populate_filters()
         dialog._resize_columns_to_all_contents()
@@ -159,6 +161,15 @@ class LoadSuppliesDialogTests(unittest.TestCase):
         )
         self.assertGreater(header.sectionSize(2), header.sectionSize(6))
 
+    def test_filter_controls_have_compact_search_and_wider_combos(self):
+        dialog = self._dialog()
+        self.assertEqual(dialog.name_search.width(), SUPPLY_SEARCH_WIDTH)
+        self.assertEqual(dialog.shop_filter.width(), FILTER_COMBO_WIDTH)
+        self.assertEqual(dialog.status_filter.width(), FILTER_COMBO_WIDTH)
+        self.assertEqual(
+            dialog.marketplace_filter.width(), FILTER_COMBO_WIDTH,
+        )
+
     def test_marketplaces_remain_grouped_when_secondary_sort_changes(self):
         dialog = self._dialog()
         dialog._supplies.extend([
@@ -171,6 +182,25 @@ class LoadSuppliesDialogTests(unittest.TestCase):
         dialog._apply_filters()
         marketplaces = [dialog.table.item(row, 4).text() for row in range(4)]
         self.assertEqual(marketplaces, ["OZON", "OZON", "WB", "WB"])
+
+    def test_marketplace_filter_and_name_search_combine(self):
+        dialog = self._dialog()
+        dialog.marketplace_filter.setCurrentIndex(2)
+        self.assertEqual(dialog.table.rowCount(), 1)
+        self.assertEqual(dialog._visible_number(0), "OZ-2")
+        dialog.name_search.setText("длинное")
+        self.assertEqual(dialog.table.rowCount(), 1)
+        dialog.name_search.setText("wb shop")
+        self.assertEqual(dialog.table.rowCount(), 0)
+
+    def test_dialog_loads_supplies_automatically(self):
+        with patch(
+            "gui.dialogs.load_supplies_dialog.TriguClient.list_active_supplies",
+            return_value=self._supplies(),
+        ):
+            dialog = LoadSuppliesDialog()
+            self.app.processEvents()
+        self.assertEqual(dialog.table.rowCount(), 2)
 
 
 class TriguOrderingTests(unittest.TestCase):

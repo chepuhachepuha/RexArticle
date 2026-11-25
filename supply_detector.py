@@ -10,7 +10,7 @@ _first_page_cache = {}
 
 TRIGU_OZON_PICK_LIST_FORMAT = "trigu_ozon_pick_list"
 _TRIGU_PICK_LIST_HEADERS = {
-    "название", "цвет", "размер", "артикул", "стикер-заказ",
+    "название", "цвет", "артикул", "стикер-заказ",
 }
 
 
@@ -32,11 +32,15 @@ def trigu_ozon_pick_list_metadata(lines: list) -> dict | None:
     if number_index is None:
         return None
 
-    title_candidates = [
-        line for line in cleaned[:number_index]
-        if line.casefold() != "ozon"
-    ]
-    supply_name = title_candidates[-1] if title_candidates else ""
+    ozon_index = next(
+        (
+            index for index, line in enumerate(cleaned[:number_index])
+            if line.casefold() == "ozon"
+        ),
+        -1,
+    )
+    title_lines = cleaned[ozon_index + 1:number_index]
+    supply_name = " ".join(title_lines)
 
     store_name = "UNKNOWN"
     for index, line in enumerate(cleaned):

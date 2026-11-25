@@ -18,6 +18,7 @@ from gui.main_window import (
     _delivery_output_folder_name,
     _matching_article_indices,
     _override_dialog_directory,
+    _rename_trigu_pick_list_pdf,
     _sync_not_found_file,
 )
 from matcher import (
@@ -28,7 +29,10 @@ from matcher import (
     resolve_matcher_name,
 )
 from indexer import _index_from_files
-from ozon_parser import parse_article_and_size, parse_ozon_supply
+from ozon_parser import (
+    _join_pick_list_cell_lines, _parse_trigu_ozon_pick_list,
+    parse_article_and_size, parse_ozon_supply,
+)
 from core.ozon_sizes import clean_custom_sizes, validate_custom_size
 from supply_detector import detect_supply_type
 from core.personalization import (
@@ -60,6 +64,77 @@ class OzonParserTests(unittest.TestCase):
                 detect_supply_type("task.pdf"),
                 {"store_name": "ANIREX", "supply_type": "OZON"},
             )
+
+    def test_detects_trigu_ozon_pick_list_metadata(self):
+        lines = [
+            "OZON", "Никита Озон вечер 25.11 - 4", "OZ-WH-002 9456",
+            "МАГАЗИН", "Никита Озон", "№", "ФОТО", "НАЗВАНИЕ",
+            "ЦВЕТ", "РАЗМЕР", "АРТИКУЛ", "СТИКЕР-ЗАКАЗ",
+        ]
+        with patch("supply_detector.get_first_page_lines", return_value=lines):
+            self.assertEqual(
+                detect_supply_type("pick-list.pdf"),
+                {
+                    "format": "trigu_ozon_pick_list",
+                    "supply_name": "Никита Озон вечер 25.11 - 4",
+                    "supply_number": "OZ-WH-0029456",
+                    "store_name": "Никита Озон",
+                    "supply_type": "OZON",
+                },
+            )
+
+    def test_trigu_pick_list_wrapped_articles_are_joined(self):
+        self.assertEqual(
+            _join_pick_list_cell_lines("f_t_snegurochka_\nb_006"),
+            "f_t_snegurochka_b_006",
+        )
+        self.assertEqual(
+            _join_pick_list_cell_lines("Атака титанов\n5"),
+            "Атака титанов 5",
+        )
+        self.assertEqual(
+            _join_pick_list_cell_lines("F_d_FireGoat_\nb_014,4XL"),
+            "F_d_FireGoat_b_014,4XL",
+        )
+
+    def test_trigu_pick_list_parser_uses_top_size_and_product_location(self):
+        class FakePage:
+            def get_textbox(self, rectangle):
+                return {
+                    0: "1",
+                    20: "Футболка с принтом на спине",
+                    40: "XL\n52",
+                    50: "f_code_\n001",
+                }.get(round(rectangle.x0), "")
+
+        document = Mock()
+        document.__enter__ = Mock(return_value=document)
+        document.__exit__ = Mock(return_value=False)
+        document.__iter__ = Mock(return_value=iter([FakePage()]))
+        with patch("ozon_parser.fitz.open", return_value=document), patch(
+            "ozon_parser._trigu_pick_list_page_layout",
+            return_value=([0, 10, 20, 30, 40, 50, 60, 70], [0, 10, 20]),
+        ), patch("ozon_parser._draw_trigu_pick_list_grid"):
+            self.assertEqual(
+                _parse_trigu_ozon_pick_list("pick-list.pdf"),
+                (["f_code_001"], ["XL"], ["СПИНА"]),
+            )
+
+    def test_trigu_pick_list_pdf_rename_uses_safe_collision_suffixes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.pdf"
+            source.write_bytes(b"new")
+            target = Path(directory) / "Никита Озон вечер 25.11 - 4.pdf"
+            target.write_bytes(b"old")
+            renamed = _rename_trigu_pick_list_pdf(
+                str(source), "Никита Озон вечер 25.11 - 4", "OZ-WH-0029456"
+            )
+            self.assertEqual(
+                Path(renamed).name,
+                "Никита Озон вечер 25.11 - 4 [OZ-WH-0029456].pdf",
+            )
+            self.assertEqual(Path(renamed).read_bytes(), b"new")
+            self.assertEqual(target.read_bytes(), b"old")
 
 
 class ArticleCorrectionTests(unittest.TestCase):

@@ -3,10 +3,12 @@ import os
 import re
 import time
 from functools import lru_cache
+import fitz
 import pdfplumber
 from typing import List, Tuple
 
 from ozon_marker import mark_ozon_pdf_in_memory
+from supply_detector import is_trigu_ozon_pick_list_lines
 from core.ozon_sizes import (
     GROUPED_BASE_SIZES, STANDARD_SIZES, load_custom_sizes, normalize_size,
 )
@@ -125,6 +127,170 @@ def is_empty_row(row) -> bool:
     if not row:
         return True
     return all(not cell or str(cell).strip() == "" for cell in row)
+
+
+_TRIGU_PICK_LIST_HEADERS = (
+    "№", "ФОТО", "НАЗВАНИЕ", "ЦВЕТ", "РАЗМЕР", "АРТИКУЛ",
+    "СТИКЕР-ЗАКАЗ",
+)
+
+
+def _join_pick_list_cell_lines(value: str) -> str:
+    """Join visual wraps while preserving spaces in human-readable articles."""
+    lines = [re.sub(r"\s+", " ", line.strip()) for line in value.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    result = lines[0]
+    for line in lines[1:]:
+        if result.endswith(("_", "-", "/")):
+            result += line
+        else:
+            result += f" {line}"
+    return result.strip()
+
+
+def _trigu_pick_list_header_words(page):
+    headers = {}
+    for word in page.get_text("words"):
+        text = str(word[4]).strip().upper()
+        if text in _TRIGU_PICK_LIST_HEADERS and text not in headers:
+            headers[text] = word
+    if not set(_TRIGU_PICK_LIST_HEADERS).issubset(headers):
+        return None
+    return headers
+
+
+def _merge_coordinates(values, tolerance=1.0):
+    groups = []
+    for value in sorted(values):
+        if not groups or value - groups[-1][-1] > tolerance:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return [sum(group) / len(group) for group in groups]
+
+
+def _trigu_pick_list_page_layout(page):
+    headers = _trigu_pick_list_header_words(page)
+    if not headers:
+        return None
+
+    header_y = (
+        headers["НАЗВАНИЕ"][1] + headers["НАЗВАНИЕ"][3]
+    ) / 2
+    horizontal_lines = []
+    table_edges = []
+    minimum_width = page.rect.width * 0.80
+    for drawing in page.get_drawings():
+        for item in drawing.get("items", []):
+            if item[0] == "l":
+                first, second = item[1], item[2]
+                if (
+                    abs(first.y - second.y) <= 1.0
+                    and abs(second.x - first.x) >= minimum_width
+                ):
+                    horizontal_lines.append((first.y + second.y) / 2)
+                    table_edges.append((min(first.x, second.x), max(first.x, second.x)))
+            elif item[0] == "re":
+                rect = item[1]
+                if rect.width >= minimum_width:
+                    horizontal_lines.extend((rect.y0, rect.y1))
+                    table_edges.append((rect.x0, rect.x1))
+
+    boundaries = [
+        value for value in _merge_coordinates(horizontal_lines)
+        if header_y - 20 <= value <= page.rect.height - 70
+    ]
+    if len(boundaries) < 3 or not table_edges:
+        return None
+
+    table_left = min(edge[0] for edge in table_edges)
+    table_right = max(edge[1] for edge in table_edges)
+    number_header = headers["№"]
+    photo_header = headers["ФОТО"]
+    name_header = headers["НАЗВАНИЕ"]
+    color_header = headers["ЦВЕТ"]
+    size_header = headers["РАЗМЕР"]
+    article_header = headers["АРТИКУЛ"]
+    sticker_header = headers["СТИКЕР-ЗАКАЗ"]
+    verticals = [
+        table_left,
+        (number_header[2] + photo_header[0]) / 2,
+        (photo_header[2] + name_header[0]) / 2,
+        color_header[0] - 8,
+        size_header[0] - 5,
+        (size_header[2] + article_header[0]) / 2,
+        sticker_header[0] - 6,
+        table_right,
+    ]
+    if verticals != sorted(verticals):
+        return None
+    return verticals, boundaries
+
+
+def _draw_trigu_pick_list_grid(page, verticals, boundaries):
+    """Complete the table grid in memory; the source PDF is never saved."""
+    shape = page.new_shape()
+    for x_value in verticals:
+        shape.draw_line(
+            fitz.Point(x_value, boundaries[0]),
+            fitz.Point(x_value, boundaries[-1]),
+        )
+    for y_value in boundaries:
+        shape.draw_line(
+            fitz.Point(verticals[0], y_value),
+            fitz.Point(verticals[-1], y_value),
+        )
+    shape.finish(color=(0, 0, 0), width=0.5)
+    shape.commit()
+
+
+def _parse_trigu_ozon_pick_list(pdf_path: str):
+    articles, sizes, locations = [], [], []
+    with fitz.open(pdf_path) as document:
+        for page in document:
+            layout = _trigu_pick_list_page_layout(page)
+            if layout is None:
+                continue
+            verticals, boundaries = layout
+            _draw_trigu_pick_list_grid(page, verticals, boundaries)
+            for top, bottom in zip(boundaries[1:], boundaries[2:]):
+                number = page.get_textbox(
+                    fitz.Rect(verticals[0], top, verticals[1], bottom)
+                ).strip()
+                if not re.fullmatch(r"\d+", number):
+                    continue
+
+                product_name = page.get_textbox(
+                    fitz.Rect(verticals[2], top, verticals[3], bottom)
+                ).strip()
+                size_text = page.get_textbox(
+                    fitz.Rect(verticals[4], top, verticals[5], bottom)
+                )
+                article_text = page.get_textbox(
+                    fitz.Rect(verticals[5], top, verticals[6], bottom)
+                )
+                article = _join_pick_list_cell_lines(article_text)
+                if not article:
+                    continue
+                size_lines = [line.strip() for line in size_text.splitlines() if line.strip()]
+                articles.append(article)
+                sizes.append(normalize_size(size_lines[0]) if size_lines else "0")
+                locations.append(extract_print_location(product_name))
+    return articles, sizes, locations
+
+
+def _has_trigu_ozon_pick_list(pdf_path: str) -> bool:
+    try:
+        with fitz.open(pdf_path) as document:
+            if not document.page_count:
+                return False
+            return is_trigu_ozon_pick_list_lines(
+                document[0].get_text().splitlines()
+            )
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _new_ozon_format_columns(table):
@@ -269,7 +435,9 @@ def parse_ozon_supply(pdf_path: str) -> Tuple[List[str], List[str], List[str]]:
 
     try:
         custom_sizes = tuple(load_custom_sizes())
-        if _has_new_ozon_format(pdf_path):
+        if _has_trigu_ozon_pick_list(pdf_path):
+            articles, sizes, locations = _parse_trigu_ozon_pick_list(pdf_path)
+        elif _has_new_ozon_format(pdf_path):
             articles, sizes, locations = _parse_new_ozon_format(
                 pdf_path, custom_sizes
             )

@@ -8,6 +8,55 @@ import re
 # Кэш первых страниц PDF
 _first_page_cache = {}
 
+TRIGU_OZON_PICK_LIST_FORMAT = "trigu_ozon_pick_list"
+_TRIGU_PICK_LIST_HEADERS = {
+    "название", "цвет", "размер", "артикул", "стикер-заказ",
+}
+
+
+def trigu_ozon_pick_list_metadata(lines: list) -> dict | None:
+    """Extract metadata from Trigu's Ozon picking-list header."""
+    cleaned = [str(line).strip() for line in lines if str(line).strip()]
+    normalized = {line.casefold() for line in cleaned}
+    if not _TRIGU_PICK_LIST_HEADERS.issubset(normalized):
+        return None
+
+    number_index = None
+    supply_number = ""
+    for index, line in enumerate(cleaned):
+        compact = re.sub(r"\s+", "", line).upper()
+        if re.fullmatch(r"OZ-WH-\d+", compact):
+            number_index = index
+            supply_number = compact
+            break
+    if number_index is None:
+        return None
+
+    title_candidates = [
+        line for line in cleaned[:number_index]
+        if line.casefold() != "ozon"
+    ]
+    supply_name = title_candidates[-1] if title_candidates else ""
+
+    store_name = "UNKNOWN"
+    for index, line in enumerate(cleaned):
+        if line.casefold() == "магазин" and index + 1 < len(cleaned):
+            store_name = cleaned[index + 1]
+            break
+
+    if not supply_name:
+        return None
+    return {
+        "format": TRIGU_OZON_PICK_LIST_FORMAT,
+        "supply_name": supply_name,
+        "supply_number": supply_number,
+        "store_name": store_name,
+    }
+
+
+def is_trigu_ozon_pick_list_lines(lines: list) -> bool:
+    return trigu_ozon_pick_list_metadata(lines) is not None
+
 
 def is_ozon_task_format_lines(lines: list) -> bool:
     """Return whether a page belongs to Ozon's task-list table format."""
@@ -64,6 +113,13 @@ def detect_supply_type(pdf_path: str) -> dict:
         
         if not lines:
             return {"store_name": "UNKNOWN", "supply_type": "UNKNOWN"}
+
+        trigu_pick_list = trigu_ozon_pick_list_metadata(lines)
+        if trigu_pick_list:
+            return {
+                **trigu_pick_list,
+                "supply_type": "OZON",
+            }
         
         # Новый Ozon-формат содержит полноценные заголовки таблицы и магазин
         # в строке задания. Проверяем его до общего правила для Ozon.

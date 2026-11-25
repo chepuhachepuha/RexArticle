@@ -32,7 +32,7 @@ from core.storage_backend import NetworkReadError, copy_resource
 from core.network_paths import is_network_path
 from parser import parse_wb_supply
 from ozon_parser import parse_ozon_supply
-from supply_detector import detect_supply_type
+from supply_detector import TRIGU_OZON_PICK_LIST_FORMAT, detect_supply_type
 from indexer import (
     get_index_for_source,
     has_source_index,
@@ -199,6 +199,35 @@ def _result_file_base_name(file_path, article, manual_override_path):
         else original_name
     )
     return _safe_filename_component(source_name, "print", 180)
+
+
+def _rename_trigu_pick_list_pdf(pdf_path, supply_name, supply_number):
+    """Rename a Trigu picking list without overwriting an existing PDF."""
+    directory = os.path.dirname(os.path.abspath(pdf_path))
+    safe_name = _safe_filename_component(supply_name, "Поставка", 180)
+    safe_number = _safe_filename_component(supply_number, "", 60)
+    current_path = os.path.abspath(pdf_path)
+    candidates = [os.path.join(directory, f"{safe_name}.pdf")]
+    if safe_number:
+        candidates.append(
+            os.path.join(directory, f"{safe_name} [{safe_number}].pdf")
+        )
+
+    counter = 2
+    while True:
+        if candidates:
+            candidate = os.path.abspath(candidates.pop(0))
+        else:
+            suffix = f" [{safe_number}]" if safe_number else ""
+            candidate = os.path.join(
+                directory, f"{safe_name}{suffix} ({counter}).pdf"
+            )
+            counter += 1
+        if candidate == current_path:
+            return current_path
+        if not os.path.exists(candidate):
+            os.rename(current_path, candidate)
+            return candidate
 
 class CancellationFlag(CancellationToken):
     """Backward-compatible parse cancellation flag."""
@@ -1021,6 +1050,24 @@ class MainWindow(QMainWindow):
             detected = detect_supply_type(pdf_path)
             store_name = detected["store_name"]
             supply_type = detected["supply_type"]
+
+            if detected.get("format") == TRIGU_OZON_PICK_LIST_FORMAT:
+                try:
+                    pdf_path = _rename_trigu_pick_list_pdf(
+                        pdf_path,
+                        detected.get("supply_name", ""),
+                        detected.get("supply_number", ""),
+                    )
+                except OSError as error:
+                    QMessageBox.warning(
+                        self,
+                        "Переименование PDF",
+                        "Не удалось переименовать лист подбора. "
+                        f"Разбор продолжится с исходным именем.\n\n{error}",
+                    )
+
+            if pdf_path in self.pdf_files:
+                continue
 
             store_data = stores.get(store_name, {})
             type_data = store_data.get(supply_type) if isinstance(store_data, dict) else None

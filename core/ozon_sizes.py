@@ -25,6 +25,21 @@ def normalize_size(value: str) -> str:
     return re.sub(r"\s+", "", text).upper()
 
 
+def strip_matching_article_size_suffix(article: str, size: str) -> str | None:
+    """Remove a trailing size only when it exactly matches the size column."""
+    article = str(article or "").strip()
+    size_key = normalize_size(size)
+    if not article or not size_key or size_key == "0":
+        return None
+    spaced_size = r"\s*".join(re.escape(character) for character in size_key)
+    match = re.match(
+        rf"^(?P<article>.+?)\s*(?:,|-|\s)\s*{spaced_size}\s*$",
+        article,
+        re.IGNORECASE,
+    )
+    return match.group("article").strip() if match else None
+
+
 def is_builtin_size(value: str) -> bool:
     key = normalize_size(value)
     if key in STANDARD_SIZES or key in COMMON_GROUPED_SIZES:

@@ -1285,6 +1285,20 @@ class StoreSuffixPersonalizationTests(unittest.TestCase):
             should_append_store_suffix("Unknown", True, {"Internal"})
         )
 
+    def test_delivery_folder_keeps_dots_and_number_suffix_in_supply_name(self):
+        self.assertEqual(
+            _delivery_output_folder_name(
+                r"C:\input\Пушкино 25.11 футболки - 1.pdf", "", False,
+            ),
+            "Пушкино 25.11 футболки - 1",
+        )
+        self.assertEqual(
+            _delivery_output_folder_name(
+                r"C:\input\Пушкино 25.11 футболки - 1.PDF", "", False,
+            ),
+            "Пушкино 25.11 футболки - 1",
+        )
+
     def _open_settings(self, directory, config):
         import gui.settings_window as settings_module
 

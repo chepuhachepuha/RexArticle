@@ -27,6 +27,7 @@ from gui.widgets.supply_tree import (
 from gui.widgets.override_delegate import OverrideButtonDelegate
 from gui.dialogs.parse_progress_dialog import ParseProgressDialog
 from gui.dialogs.load_supplies_dialog import LoadSuppliesDialog
+from gui.dialogs.trigu_report_dialog import TriguReportDialog
 from core.store_manager import load_stores, save_stores, get_type_data
 from core.storage_backend import NetworkReadError, copy_resource
 from core.network_paths import is_network_path
@@ -46,8 +47,12 @@ from manual_overrides import get_override, set_override, set_overrides
 from article_corrections import get_corrected_article, set_article_correction
 from core.trigu_api import (
     TriguApiError, TriguClient, load_category_order,
-    load_marketplace_order, register_categories,
+    load_marketplace_order, load_processed_supply_numbers,
+    load_processed_supply_reports, load_search_runs, load_work_finishes,
+    mark_supply_processed, mark_work_finished, record_search_run,
+    register_categories, save_processed_supply_report, clear_report_history,
 )
+from core.ozon_sizes import strip_matching_article_size_suffix
 
 
 # ============================================
@@ -177,9 +182,15 @@ def _safe_filename_component(value, fallback="result", max_length=180):
     return name or fallback
 
 
+def _pdf_name_without_suffix(path):
+    """Remove only a real PDF suffix, preserving dots in a supply name."""
+    name = ntpath.basename(str(path))
+    return name[:-4] if name.casefold().endswith(".pdf") else name
+
+
 def _delivery_output_folder_name(pdf_path, store_name, append_store_name):
     folder_name = _safe_filename_component(
-        os.path.splitext(ntpath.basename(str(pdf_path)))[0], "Поставка", 120
+        _pdf_name_without_suffix(pdf_path), "Поставка", 120
     )
     if append_store_name and store_name:
         safe_store_name = _safe_filename_component(store_name, "", 80)
@@ -818,6 +829,7 @@ class MainWindow(QMainWindow):
             button.setDefaultAction(action)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             toolbar_layout.addWidget(button)
+            return button
 
         self.load_action = QAction("📂 Загрузить", self)
         self.load_action.triggered.connect(self.load_supplies)
@@ -838,7 +850,16 @@ class MainWindow(QMainWindow):
 
         self.settings_action = QAction("⚙️ Настройки", self)
         self.settings_action.triggered.connect(self.open_settings)
-        add_action_button(self.settings_action)
+        self.settings_button = add_action_button(self.settings_action)
+
+        self.report_action = QAction("📊", self)
+        self.report_action.setToolTip("Отчёт по поставкам Trigu")
+        self.report_action.triggered.connect(self.open_trigu_report)
+        self.report_button = QToolButton(toolbar_content)
+        self.report_button.setDefaultAction(self.report_action)
+        self.report_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        toolbar_layout.addWidget(self.report_button)
+        QTimer.singleShot(0, self._resize_report_button)
 
         toolbar_layout.addStretch()
 
@@ -850,6 +871,97 @@ class MainWindow(QMainWindow):
         self.path_button.clicked.connect(self.change_output_path)
         self._update_path_button_text()
         toolbar_layout.addWidget(self.path_button)
+
+    def _resize_report_button(self):
+        """Keep the compact report control at three quarters of Settings."""
+        size = self.settings_button.sizeHint()
+        self.report_button.setFixedSize(
+            max(24, round(size.width() * 0.75)),
+            max(24, round(size.height() * 0.75)),
+        )
+
+    @staticmethod
+    def _trigu_category_quantities(items):
+        quantities = {}
+        for item in items:
+            category = str(item.get("category", "") or "").strip() or "Без категории"
+            try:
+                quantity = max(1, int(item.get("quantity", 1) or 1))
+            except (TypeError, ValueError):
+                quantity = 1
+            quantities[category] = quantities.get(category, 0) + quantity
+        return quantities
+
+    def open_trigu_report(self):
+        """Show processed supplies, recovering legacy rows where API permits."""
+        reports = load_processed_supply_reports()
+        missing_numbers = sorted(load_processed_supply_numbers() - set(reports))
+        unavailable_count = 0
+        if missing_numbers:
+            progress = QProgressDialog(
+                "Восстановление истории поставок Trigu…", "Отмена", 0,
+                len(missing_numbers), self,
+            )
+            progress.setWindowTitle("Отчёт по поставкам")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.show()
+            client = TriguClient()
+            for index, number in enumerate(missing_numbers, start=1):
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    unavailable_count += len(missing_numbers) - index + 1
+                    break
+                try:
+                    supply = client.get_supply(number)
+                    if supply is None:
+                        unavailable_count += 1
+                    else:
+                        items = client.get_supply_items(number)
+                        reports = save_processed_supply_report(
+                            number, supply.shop, supply.marketplace,
+                            self._trigu_category_quantities(items),
+                            supply_name=supply.name,
+                            supply_status=supply.status,
+                        )
+                except (OSError, TriguApiError):
+                    unavailable_count += 1
+                progress.setValue(index)
+            progress.close()
+        dialog = TriguReportDialog(
+            reports, load_search_runs(), load_work_finishes(), unavailable_count, self,
+        )
+        dialog.work_finished.connect(lambda: self._finish_report_work(dialog))
+        dialog.history_cleared.connect(lambda: self._clear_report_history(dialog))
+        dialog.exec()
+
+    def _finish_report_work(self, dialog):
+        try:
+            if not mark_work_finished():
+                QMessageBox.information(
+                    dialog, "Завершение работы",
+                    "После последнего завершения ещё не было запуска поиска.",
+                )
+                return
+        except OSError as error:
+            QMessageBox.critical(dialog, "Завершение работы", f"Не удалось сохранить границу: {error}")
+            return
+        dialog.set_work_finished(load_work_finishes())
+
+    def _clear_report_history(self, dialog):
+        try:
+            clear_report_history()
+        except OSError as error:
+            QMessageBox.critical(dialog, "Очистить историю", f"Не удалось очистить историю: {error}")
+            return
+        dialog.set_history_cleared()
+
+    @staticmethod
+    def _record_report_search_run(deliveries):
+        timestamp = record_search_run()
+        for delivery_item in deliveries:
+            if getattr(delivery_item, "trigu_number", ""):
+                delivery_item.trigu_report_search_started_at = timestamp
+        return timestamp
 
     def _update_path_button_text(self):
         path = self.output_folder
@@ -1005,15 +1117,23 @@ class MainWindow(QMainWindow):
                 self._display_store_name(store_name),
             )
             delivery.trigu_number = supply.number
+            delivery.trigu_report_categories = self._trigu_category_quantities(items)
+            delivery.trigu_report_shop = store_name
+            delivery.trigu_report_marketplace = supply_type
+            delivery.trigu_report_supply_name = supply.name
+            delivery.trigu_report_supply_status = supply.status
             articles, sizes, locations = [], [], []
             sorted_items = self._sort_trigu_items(
                 items, self.trigu_category_order
             )
             for item in sorted_items:
                 quantity = max(1, int(item.get("quantity", 1) or 1))
+                size = str(item.get("size", "")).strip() or "0"
+                article = str(item.get("article", "")).strip()
+                article = strip_matching_article_size_suffix(article, size) or article
                 for _ in range(quantity):
-                    articles.append(str(item.get("article", "")).strip())
-                    sizes.append(str(item.get("size", "")).strip() or "0")
+                    articles.append(article)
+                    sizes.append(size)
                     locations.append(self._trigu_location(item))
             self.tree_model.add_articles(
                 delivery, articles, sizes, locations,
@@ -1586,6 +1706,7 @@ class MainWindow(QMainWindow):
             return
 
         self.is_searching = True
+        self._record_report_search_run(self.delivery_items)
         self._set_actions_enabled(False)
         if not unique_stores:
             self._on_index_finished()
@@ -1601,6 +1722,7 @@ class MainWindow(QMainWindow):
         self.run_action.setEnabled(enabled)
         self.clear_action.setEnabled(enabled)
         self.settings_action.setEnabled(enabled)
+        self.report_action.setEnabled(enabled)
 
     def _on_index_finished(self):
         for delivery_item in self.delivery_items:
@@ -1654,6 +1776,33 @@ class MainWindow(QMainWindow):
             else "Готово"
         )
         self.tree_model.update_delivery_status(delivery_item, status)
+        trigu_number = getattr(delivery_item, "trigu_number", "")
+        if trigu_number:
+            try:
+                categories = getattr(delivery_item, "trigu_report_categories", None)
+                if categories is None:
+                    mark_supply_processed(trigu_number)
+                else:
+                    save_processed_supply_report(
+                        trigu_number,
+                        getattr(delivery_item, "trigu_report_shop", delivery_item.store_name),
+                        getattr(
+                            delivery_item, "trigu_report_marketplace",
+                            delivery_item.supply_type,
+                        ),
+                        categories,
+                        search_started_at=getattr(
+                            delivery_item, "trigu_report_search_started_at", None,
+                        ),
+                        supply_name=getattr(
+                            delivery_item, "trigu_report_supply_name", "",
+                        ),
+                        supply_status=getattr(
+                            delivery_item, "trigu_report_supply_status", "",
+                        ),
+                    )
+            except OSError as error:
+                print(f"[TRIGU] Не удалось сохранить историю поставки: {error}")
 
     def _on_search_finished(self):
         if self._shutdown_started:

@@ -11,6 +11,7 @@ from ozon_marker import mark_ozon_pdf_in_memory
 from supply_detector import is_trigu_ozon_pick_list_lines
 from core.ozon_sizes import (
     GROUPED_BASE_SIZES, STANDARD_SIZES, load_custom_sizes, normalize_size,
+    strip_matching_article_size_suffix,
 )
 
 
@@ -343,16 +344,7 @@ def _extract_task_size(characteristics: str) -> str:
 
 
 def _strip_task_size_suffix(article: str, size: str) -> str | None:
-    """Remove a trailing size only when it exactly matches the characteristic."""
-    if not article or not size:
-        return None
-    size_pattern = _spaced_token(size)
-    match = re.match(
-        rf"^(?P<article>.+?)\s*(?:,|-|\s)\s*{size_pattern}\s*$",
-        article,
-        re.IGNORECASE,
-    )
-    return match.group("article").strip() if match else None
+    return strip_matching_article_size_suffix(article, size)
 
 
 def _parse_new_ozon_format(pdf_path: str, custom_sizes: tuple[str, ...]):

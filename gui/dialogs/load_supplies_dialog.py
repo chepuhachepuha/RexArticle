@@ -1,21 +1,68 @@
 """Choose deliveries from Trigu or load PDF files locally."""
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
     QPushButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
     QWidget, QComboBox, QHeaderView, QListWidget, QListWidgetItem, QSplitter,
-    QLineEdit,
+    QLineEdit, QStyle, QStyleOptionButton,
 )
 
 from core.trigu_api import (
     TriguApiError, TriguClient, load_marketplace_order,
+    load_processed_supply_numbers,
 )
 
 
 FILTER_COMBO_WIDTH = 150
 SUPPLY_SEARCH_WIDTH = 220
+
+
+class _SelectionHeader(QHeaderView):
+    """A clickable checkbox in the first header section."""
+
+    selection_toggled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self._check_state = Qt.CheckState.Unchecked
+
+    def set_check_state(self, state):
+        state = Qt.CheckState(state)
+        if state != self._check_state:
+            self._check_state = state
+            self.viewport().update()
+
+    def paintSection(self, painter, rect, logical_index):
+        super().paintSection(painter, rect, logical_index)
+        if logical_index != 0:
+            return
+        option = QStyleOptionButton()
+        option.rect = rect
+        option.state = QStyle.StateFlag.State_Enabled
+        if self._check_state == Qt.CheckState.Checked:
+            option.state |= QStyle.StateFlag.State_On
+        elif self._check_state == Qt.CheckState.PartiallyChecked:
+            option.state |= QStyle.StateFlag.State_NoChange
+        else:
+            option.state |= QStyle.StateFlag.State_Off
+        indicator = self.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator, option, self
+        )
+        option.rect = indicator
+        option.rect.moveCenter(rect.center())
+        self.style().drawControl(
+            QStyle.ControlElement.CE_CheckBox, option, painter, self
+        )
+
+    def mouseReleaseEvent(self, event):
+        if self.logicalIndexAt(event.position().toPoint()) == 0:
+            self.selection_toggled.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class LoadSuppliesDialog(QDialog):
@@ -28,6 +75,7 @@ class LoadSuppliesDialog(QDialog):
         self.local_files = []
         self._supplies = []
         self._selected_numbers = set()
+        self._processed_numbers = load_processed_supply_numbers()
         self._updating_table = False
         self.marketplace_order = load_marketplace_order()
         self._sort_column = 1
@@ -77,11 +125,13 @@ class LoadSuppliesDialog(QDialog):
         ])
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.table.setSortingEnabled(False)
-        table_header = self.table.horizontalHeader()
+        table_header = _SelectionHeader(self.table)
+        self.table.setHorizontalHeader(table_header)
         table_header.setStretchLastSection(False)
         table_header.setSortIndicatorShown(True)
         table_header.setSortIndicator(1, self._sort_order)
         table_header.sortIndicatorChanged.connect(self._on_sort_changed)
+        table_header.selection_toggled.connect(self._toggle_visible_selection)
         self.table.itemChanged.connect(self._on_checkbox_changed)
         splitter.addWidget(self.table)
 
@@ -233,13 +283,20 @@ class LoadSuppliesDialog(QDialog):
                 else Qt.CheckState.Unchecked
             )
             checkbox.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if item.number.upper() in self._processed_numbers:
+                checkbox.setBackground(QColor("#244d35"))
+                checkbox.setToolTip("Поставка уже была обработана")
             self.table.setItem(row, 0, checkbox)
             values = self._supply_values(item)
             for column, value in enumerate(values, start=1):
                 cell = QTableWidgetItem(value)
                 cell.setData(Qt.ItemDataRole.UserRole, item.number)
+                if item.number.upper() in self._processed_numbers:
+                    cell.setBackground(QColor("#244d35"))
+                    cell.setToolTip("Поставка уже была обработана")
                 self.table.setItem(row, column, cell)
         self._updating_table = False
+        self._sync_header_checkbox()
         self._refresh_selected_list()
         self.trigu_status.setText(f"Показано активных поставок: {len(items)}")
 
@@ -286,6 +343,39 @@ class LoadSuppliesDialog(QDialog):
             self._selected_numbers.add(number)
         else:
             self._selected_numbers.discard(number)
+        self._sync_header_checkbox()
+        self._refresh_selected_list()
+
+    def _visible_numbers(self):
+        return {
+            self._visible_number(row)
+            for row in range(self.table.rowCount())
+            if self._visible_number(row)
+        }
+
+    def _sync_header_checkbox(self):
+        visible = self._visible_numbers()
+        selected = visible & self._selected_numbers
+        if not selected:
+            state = Qt.CheckState.Unchecked
+        elif selected == visible:
+            state = Qt.CheckState.Checked
+        else:
+            state = Qt.CheckState.PartiallyChecked
+        self.table.horizontalHeader().set_check_state(state)
+
+    def _toggle_visible_selection(self):
+        visible = self._visible_numbers()
+        if not visible:
+            return
+        if visible.issubset(self._selected_numbers):
+            self._selected_numbers.difference_update(visible)
+        else:
+            self._selected_numbers.update(visible)
+        self._updating_table = True
+        self._restore_checkbox_states()
+        self._updating_table = False
+        self._sync_header_checkbox()
         self._refresh_selected_list()
 
     def _restore_checkbox_states(self):
@@ -319,6 +409,7 @@ class LoadSuppliesDialog(QDialog):
         self._updating_table = True
         self._restore_checkbox_states()
         self._updating_table = False
+        self._sync_header_checkbox()
         self._refresh_selected_list()
 
     def _choose_local_files(self):
